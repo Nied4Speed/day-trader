@@ -100,45 +100,45 @@ Deferred to future release. Tracked but not in current roadmap.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| DATA-01 | Phase 1 | Pending |
-| DATA-02 | Phase 1 | Pending |
-| DATA-03 | Phase 1 | Pending |
-| DATA-04 | Phase 1 | Pending |
-| DATA-05 | Phase 1 | Pending |
-| STRT-01 | Phase 1 | Pending |
-| STRT-02 | Phase 2 | Pending |
-| STRT-03 | Phase 2 | Pending |
-| STRT-04 | Phase 2 | Pending |
-| STRT-05 | Phase 1 | Pending |
-| EXEC-01 | Phase 2 | Pending |
-| EXEC-02 | Phase 2 | Pending |
-| EXEC-03 | Phase 2 | Pending |
-| EXEC-04 | Phase 2 | Pending |
-| PERF-01 | Phase 3 | Pending |
-| PERF-02 | Phase 3 | Pending |
-| PERF-03 | Phase 3 | Pending |
-| PERF-04 | Phase 3 | Pending |
-| ARNA-01 | Phase 3 | Pending |
-| ARNA-02 | Phase 3 | Pending |
-| ARNA-03 | Phase 3 | Pending |
-| ARNA-04 | Phase 3 | Pending |
-| EVOL-01 | Phase 4 | Pending |
-| EVOL-02 | Phase 4 | Pending |
-| EVOL-03 | Phase 4 | Pending |
-| EVOL-04 | Phase 4 | Pending |
-| EVOL-05 | Phase 4 | Pending |
-| EVOL-06 | Phase 4 | Pending |
-| DASH-01 | Phase 5 | Pending |
-| DASH-02 | Phase 5 | Pending |
-| DASH-03 | Phase 5 | Pending |
-| DASH-04 | Phase 5 | Pending |
-| DASH-05 | Phase 5 | Pending |
+| DATA-01 | Phase 1 - Foundation | Pending |
+| DATA-02 | Phase 1 - Foundation | Pending |
+| DATA-03 | Phase 1 - Foundation | Pending |
+| DATA-04 | Phase 1 - Foundation | Pending |
+| DATA-05 | Phase 1 - Foundation | Pending |
+| STRT-01 | Phase 1 - Foundation | Pending |
+| STRT-05 | Phase 1 - Foundation | Pending |
+| STRT-02 | Phase 2 - Strategy Engine and Execution | Pending |
+| STRT-03 | Phase 2 - Strategy Engine and Execution | Pending |
+| STRT-04 | Phase 2 - Strategy Engine and Execution | Pending |
+| EXEC-01 | Phase 2 - Strategy Engine and Execution | Pending |
+| EXEC-02 | Phase 2 - Strategy Engine and Execution | Pending |
+| EXEC-03 | Phase 2 - Strategy Engine and Execution | Pending |
+| EXEC-04 | Phase 2 - Strategy Engine and Execution | Pending |
+| PERF-01 | Phase 3 - Arena Orchestrator | Pending |
+| PERF-02 | Phase 3 - Arena Orchestrator | Pending |
+| PERF-03 | Phase 3 - Arena Orchestrator | Pending |
+| PERF-04 | Phase 3 - Arena Orchestrator | Pending |
+| ARNA-01 | Phase 3 - Arena Orchestrator | Pending |
+| ARNA-02 | Phase 3 - Arena Orchestrator | Pending |
+| ARNA-03 | Phase 3 - Arena Orchestrator | Pending |
+| ARNA-04 | Phase 3 - Arena Orchestrator | Pending |
+| EVOL-01 | Phase 4 - Evolutionary Loop | Pending |
+| EVOL-02 | Phase 4 - Evolutionary Loop | Pending |
+| EVOL-03 | Phase 4 - Evolutionary Loop | Pending |
+| EVOL-04 | Phase 4 - Evolutionary Loop | Pending |
+| EVOL-05 | Phase 4 - Evolutionary Loop | Pending |
+| EVOL-06 | Phase 4 - Evolutionary Loop | Pending |
+| DASH-01 | Phase 5 - Dashboard | Pending |
+| DASH-02 | Phase 5 - Dashboard | Pending |
+| DASH-03 | Phase 5 - Dashboard | Pending |
+| DASH-04 | Phase 5 - Dashboard | Pending |
+| DASH-05 | Phase 5 - Dashboard | Pending |
 
 **Coverage:**
 - v1 requirements: 31 total
 - Mapped to phases: 31
-- Unmapped: 0 ✓
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-03-02*
-*Last updated: 2026-03-02 after initial definition*
+*Last updated: 2026-03-02 after roadmap creation*

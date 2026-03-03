@@ -347,6 +347,59 @@ async def list_trades(limit: int = 100):
         db.close()
 
 
+@app.get("/api/sessions")
+async def list_sessions():
+    """Get all past trading sessions with summaries."""
+    db = get_session(DB_PATH)
+    try:
+        sessions = db.query(SessionRecord).order_by(SessionRecord.id.desc()).all()
+        return [
+            {
+                "id": s.id,
+                "date": s.session_date,
+                "generation": s.generation,
+                "started_at": s.started_at.isoformat() if s.started_at else None,
+                "ended_at": s.ended_at.isoformat() if s.ended_at else None,
+                "total_bars": s.total_bars,
+                "total_trades": s.total_trades,
+                "summary": s.summary,
+            }
+            for s in sessions
+        ]
+    finally:
+        db.close()
+
+
+@app.get("/api/sessions/{session_date}/performance")
+async def session_performance(session_date: str):
+    """Get all performance snapshots for a session (timelapse data)."""
+    db = get_session(DB_PATH)
+    try:
+        snapshots = (
+            db.query(PerformanceSnapshot)
+            .filter(PerformanceSnapshot.session_date == session_date)
+            .order_by(PerformanceSnapshot.timestamp.asc())
+            .all()
+        )
+        by_model: dict = {}
+        for s in snapshots:
+            model = db.query(TradingModel).get(s.model_id)
+            name = model.name if model else f"model_{s.model_id}"
+            if name not in by_model:
+                by_model[name] = {"model_id": s.model_id, "name": name, "strategy_type": model.strategy_type if model else "", "points": []}
+            by_model[name]["points"].append({
+                "timestamp": s.timestamp.isoformat(),
+                "equity": s.equity,
+                "return_pct": s.return_pct,
+                "sharpe": s.sharpe_ratio,
+                "drawdown": s.max_drawdown,
+                "trades": s.total_trades,
+            })
+        return list(by_model.values())
+    finally:
+        db.close()
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint for live dashboard updates."""

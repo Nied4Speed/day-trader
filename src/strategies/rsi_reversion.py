@@ -19,7 +19,7 @@ class RSIReversionStrategy(Strategy):
         self.rsi_period: int = 14
         self.oversold: float = 30.0
         self.overbought: float = 70.0
-        self.position_size: int = 10
+        self.position_size: int = 1
         super().__init__(name, params)
 
     def _compute_rsi(self, closes: pd.Series) -> float:

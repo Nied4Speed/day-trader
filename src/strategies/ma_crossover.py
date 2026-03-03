@@ -17,7 +17,7 @@ class MACrossoverStrategy(Strategy):
     def __init__(self, name: str, params: Optional[dict] = None):
         self.fast_period: int = 10
         self.slow_period: int = 30
-        self.position_size: int = 10
+        self.position_size: int = 1
         self._prev_fast: dict[str, float] = {}
         self._prev_slow: dict[str, float] = {}
         super().__init__(name, params)

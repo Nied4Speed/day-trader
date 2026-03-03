@@ -25,11 +25,11 @@ class AlpacaConfig:
 @dataclass
 class ArenaConfig:
     model_count: int = 10
-    initial_capital: float = 100_000.0
+    initial_capital: float = 1_000.0
     transaction_cost_pct: float = 0.0005  # 0.05% per side
-    max_position_pct: float = 0.10  # max 10% of capital in one position
-    max_daily_loss_pct: float = 0.05  # max 5% daily loss per model
-    max_open_positions: int = 5
+    max_position_pct: float = 0.20  # max 20% of capital in one position
+    max_daily_loss_pct: float = 0.10  # max 10% daily loss per model
+    max_open_positions: int = 3
     elimination_rate: float = 0.25  # bottom 25% eliminated
     mutation_range: float = 0.15  # +/- 15% parameter perturbation
     symbols: list[str] = field(default_factory=lambda: [

@@ -18,7 +18,7 @@ class MomentumStrategy(Strategy):
         self.lookback: int = 20
         self.buy_threshold: float = 0.02  # 2% momentum to buy
         self.sell_threshold: float = -0.01  # -1% momentum to sell
-        self.position_size: int = 10
+        self.position_size: int = 1
         self.volume_filter: float = 1.5  # volume must be 1.5x average
         super().__init__(name, params)
 

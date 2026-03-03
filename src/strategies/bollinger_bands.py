@@ -18,7 +18,7 @@ class BollingerBandsStrategy(Strategy):
     def __init__(self, name: str, params: Optional[dict] = None):
         self.period: int = 20
         self.num_std: float = 2.0
-        self.position_size: int = 10
+        self.position_size: int = 1
         super().__init__(name, params)
 
     def on_bar(self, bar: BarData) -> Optional[TradeSignal]:

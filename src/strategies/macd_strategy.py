@@ -19,7 +19,7 @@ class MACDStrategy(Strategy):
         self.fast_period: int = 12
         self.slow_period: int = 26
         self.signal_period: int = 9
-        self.position_size: int = 10
+        self.position_size: int = 1
         self.histogram_threshold: float = 0.0
         self._prev_histogram: dict[str, float] = {}
         super().__init__(name, params)

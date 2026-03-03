@@ -24,7 +24,7 @@ class MLPredictorStrategy(Strategy):
         self.retrain_interval: int = 50
         self.buy_threshold: float = 0.001  # 0.1% predicted return
         self.sell_threshold: float = -0.0005
-        self.position_size: int = 10
+        self.position_size: int = 1
         self.learning_rate: float = 0.001
         self._model: Optional[SGDRegressor] = None
         self._bars_since_train: int = 0

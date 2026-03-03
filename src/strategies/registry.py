@@ -9,6 +9,10 @@ from src.strategies.macd_strategy import MACDStrategy
 from src.strategies.ml_predictor import MLPredictorStrategy
 from src.strategies.momentum import MomentumStrategy
 from src.strategies.rsi_reversion import RSIReversionStrategy
+from src.strategies.vwap_reversion import VWAPReversionStrategy
+from src.strategies.stochastic import StochasticStrategy
+from src.strategies.breakout import BreakoutStrategy
+from src.strategies.mean_reversion import MeanReversionStrategy
 
 STRATEGY_REGISTRY: dict[str, type[Strategy]] = {
     "ma_crossover": MACrossoverStrategy,
@@ -17,6 +21,10 @@ STRATEGY_REGISTRY: dict[str, type[Strategy]] = {
     "bollinger_bands": BollingerBandsStrategy,
     "ml_predictor": MLPredictorStrategy,
     "macd": MACDStrategy,
+    "vwap_reversion": VWAPReversionStrategy,
+    "stochastic": StochasticStrategy,
+    "breakout": BreakoutStrategy,
+    "mean_reversion": MeanReversionStrategy,
 }
 
 

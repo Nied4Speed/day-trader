@@ -77,8 +77,10 @@ class Strategy(ABC):
 
     strategy_type: str = "base"
 
-    # Strategies should liquidate when this many minutes remain
-    LIQUIDATION_WINDOW: float = 5.0
+    # Stop opening new positions when this many minutes remain
+    NO_BUY_WINDOW: float = 10.0
+    # Force-sell all positions when this many minutes remain
+    LIQUIDATION_WINDOW: float = 3.0
 
     def __init__(self, name: str, params: Optional[dict] = None):
         self.name = name
@@ -256,22 +258,32 @@ class Strategy(ABC):
         return None
 
     def check_liquidation(self, bar: BarData) -> Optional[TradeSignal]:
-        """If session is ending and we hold this symbol, sell everything.
+        """If session is ending, manage position wind-down.
 
         Strategies should call this at the TOP of on_bar(). If it returns
         a signal, return it immediately — winding down takes priority.
+
+        Two phases:
+          NO_BUY_WINDOW (10 min): block new entries, let existing positions ride.
+          LIQUIDATION_WINDOW (3 min): force-sell everything.
         """
-        if (
-            bar.minutes_remaining is not None
-            and bar.minutes_remaining <= self.LIQUIDATION_WINDOW
-        ):
+        if bar.minutes_remaining is None:
+            return None
+
+        # Phase 2: force liquidation
+        if bar.minutes_remaining <= self.LIQUIDATION_WINDOW:
             qty = self._positions.get(bar.symbol, 0)
             if qty > 0:
                 return TradeSignal(
                     symbol=bar.symbol, side="sell", quantity=qty
                 )
-            # Don't open new positions in liquidation window
             return TradeSignal(symbol="__SKIP__", side="sell", quantity=0)
+
+        # Phase 1: no new buys, but hold existing positions
+        if bar.minutes_remaining <= self.NO_BUY_WINDOW:
+            if self._positions.get(bar.symbol, 0) == 0:
+                return TradeSignal(symbol="__SKIP__", side="sell", quantity=0)
+
         return None
 
     def record_bar(self, bar: BarData) -> None:

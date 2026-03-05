@@ -34,7 +34,7 @@ class ArenaConfig:
     session_1_minutes: int = 180  # 3 hours
     session_2_minutes: int = 180  # 3 hours
     break_minutes: int = 15  # break between sessions for self-improvement
-    market_close_buffer_minutes: int = 10  # stop trading this many min before close
+    market_close_buffer_minutes: int = 2  # session timer ends this many min before close
     warmup_bars: int = 50  # historical bars to prime indicators
     premarket_warmup_enabled: bool = True  # poll for pre-market bars before Session 1
     premarket_start_hour_et: int = 9  # begin pre-market warmup at this hour (ET)

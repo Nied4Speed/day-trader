@@ -930,13 +930,13 @@ class Arena:
         }
 
     def _is_in_liquidation_window(self) -> bool:
-        """Check if we're in the session's final minutes (no new entries)."""
+        """Check if we're in the session's no-buy window (no new entries)."""
         if self._session_start_time and self._current_session_minutes:
             remaining = self._current_session_minutes - self._session_elapsed_minutes()
-            if remaining <= Strategy.LIQUIDATION_WINDOW:
+            if remaining <= Strategy.NO_BUY_WINDOW:
                 return True
         if not self.simulate:
-            if self._minutes_until_market_close() <= Strategy.LIQUIDATION_WINDOW:
+            if self._minutes_until_market_close() <= Strategy.NO_BUY_WINDOW:
                 return True
         return False
 
@@ -1423,6 +1423,13 @@ class Arena:
         use_memory = self.config.arena.mutation_memory_enabled
         dampening = self.config.arena.mutation_bias_dampening
 
+        # Wire COLLAB voter eligibility: top 5 non-collab strategy types vote
+        top_types = [m.strategy_type for m in leaderboard if m.strategy_type != "collab"][:5]
+        collab = next((s for s in self._models.values() if s.strategy_type == "collab"), None)
+        if collab and top_types:
+            collab.set_eligible_voters(top_types)
+            logger.info(f"COLLAB voters updated: {top_types}")
+
         db = get_session(self.config.db_path)
         try:
             for metrics in leaderboard:
@@ -1573,6 +1580,11 @@ class Arena:
         self.tracker.initialize_models(models)
         self.tracker.set_session_number(session_number)
         self.tracker.set_session_date(self._session_date)
+
+        # Snapshot params BEFORE any adapt() calls for adaptation drift logging
+        self._session_start_params: dict[int, dict] = {
+            mid: {**strategy.get_params()} for mid, strategy in self._models.items()
+        }
 
         # Reset position manager and regime detector for this session
         total_capital = sum(m.current_capital for m in models)
@@ -1793,8 +1805,9 @@ class Arena:
                     mid: {**strategy.get_params(), "_watch_rules": list(strategy._watch_rules)}
                     for mid, strategy in self._models.items()
                 }
+                session_start_params_1 = dict(self._session_start_params)
                 self._self_improve()
-                self._generate_improvement_summaries(param_snapshots)
+                self._generate_improvement_summaries(param_snapshots, session_start_params=session_start_params_1)
             else:
                 logger.info("Self-improvement disabled (manual only)")
 
@@ -1819,8 +1832,9 @@ class Arena:
                     mid: {**strategy.get_params(), "_watch_rules": list(strategy._watch_rules)}
                     for mid, strategy in self._models.items()
                 }
+                session_start_params_2 = dict(self._session_start_params)
                 self._self_improve()
-                self._generate_improvement_summaries(param_snapshots_2, session_number=2)
+                self._generate_improvement_summaries(param_snapshots_2, session_number=2, session_start_params=session_start_params_2)
 
             # === DAY TOTAL ===
             self._set_status("complete", "Day complete")
@@ -1899,9 +1913,11 @@ class Arena:
                         }
                         for mid, strategy in self._models.items()
                     }
+                    session_start_params = dict(self._session_start_params)
                     self._self_improve()
                     self._generate_improvement_summaries(
-                        param_snapshots, session_number=session_number
+                        param_snapshots, session_number=session_number,
+                        session_start_params=session_start_params,
                     )
                 else:
                     logger.info(f"Self-improvement disabled after S{session_number}")
@@ -2416,12 +2432,18 @@ class Arena:
 
         self._save_and_print_summaries(summaries, f"SESSION {session_number} MODEL REFLECTIONS")
 
-    def _generate_improvement_summaries(self, param_snapshots: dict[int, dict], session_number: int = 1) -> None:
+    def _generate_improvement_summaries(
+        self,
+        param_snapshots: dict[int, dict],
+        session_number: int = 1,
+        session_start_params: dict[int, dict] | None = None,
+    ) -> None:
         """Generate per-model reflections after self-improvement.
 
         Args:
-            param_snapshots: {model_id: old_params} captured before mutation.
+            param_snapshots: {model_id: old_params} captured post-adapt, pre-mutate.
             session_number: which session this improvement follows (1 or 2).
+            session_start_params: {model_id: params} captured at session start, before adapt().
         """
         leaderboard = self.tracker.get_leaderboard()
         if not leaderboard:
@@ -2439,7 +2461,7 @@ class Arena:
             new_params = strategy.get_params()
             old_params = param_snapshots.get(model_id, {})
 
-            # Compute what changed
+            # Compute mutation changes (post-adapt -> post-mutate)
             changes = {}
             for key in set(list(old_params.keys()) + list(new_params.keys())):
                 old_val = old_params.get(key)
@@ -2447,6 +2469,35 @@ class Arena:
                 if old_val != new_val and isinstance(old_val, (int, float)) and isinstance(new_val, (int, float)):
                     pct_change = ((new_val - old_val) / abs(old_val) * 100) if old_val != 0 else 0
                     changes[key] = {"old": old_val, "new": new_val, "pct": round(pct_change, 1)}
+
+            # Compute adaptation drift (session-start -> post-adapt)
+            adapt_changes = {}
+            start_params = (session_start_params or {}).get(model_id, {})
+            if start_params:
+                for key in set(list(start_params.keys()) + list(old_params.keys())):
+                    start_val = start_params.get(key)
+                    adapted_val = old_params.get(key)
+                    if (
+                        start_val != adapted_val
+                        and isinstance(start_val, (int, float))
+                        and isinstance(adapted_val, (int, float))
+                    ):
+                        pct = ((adapted_val - start_val) / abs(start_val) * 100) if start_val != 0 else 0
+                        adapt_changes[key] = {"old": start_val, "new": adapted_val, "pct": round(pct, 1)}
+
+            # Compute net change (session-start -> post-mutate)
+            net_changes = {}
+            if start_params:
+                for key in set(list(start_params.keys()) + list(new_params.keys())):
+                    start_val = start_params.get(key)
+                    final_val = new_params.get(key)
+                    if (
+                        start_val != final_val
+                        and isinstance(start_val, (int, float))
+                        and isinstance(final_val, (int, float))
+                    ):
+                        pct = ((final_val - start_val) / abs(start_val) * 100) if start_val != 0 else 0
+                        net_changes[key] = {"old": start_val, "new": final_val, "pct": round(pct, 1)}
 
             # Determine mutation strength applied
             if metrics.return_pct < 0:
@@ -2456,12 +2507,22 @@ class Arena:
             else:
                 mutation_label = "fine-tune (2%)"
 
-            lines = [f"[{name}] — Post-S{session_number} Improvement Reflection"]
+            adapt_cycles = self._adapt_bar_count // self._adapt_interval if self._adapt_interval else 0
+            lines = [f"[{name}] — Post-S{session_number} Improvement"]
             lines.append(f"  S{session_number} return: {metrics.return_pct:+.3f}% | Mutation strength: {mutation_label}")
 
+            # Adaptation drift section
+            if adapt_changes:
+                lines.append(f"  Adaptation drift ({adapt_cycles} adapt cycles):")
+                for param, delta in sorted(adapt_changes.items()):
+                    direction = "up" if delta["pct"] > 0 else "down"
+                    lines.append(f"    {param}: {delta['old']} -> {delta['new']} ({direction} {abs(delta['pct']):.1f}%)")
+            elif start_params:
+                lines.append(f"  Adaptation drift ({adapt_cycles} adapt cycles): no params changed")
+
+            # Mutation section
             if not changes:
-                lines.append("  Tweaks: No parameters were mutated this round.")
-                lines.append(f"  Rationale: Random selection didn't pick any params. Will trade S{session_number + 1} with same config.")
+                lines.append("  Mutation: No parameters were mutated this round.")
             else:
                 # Load mutation memory for bias info
                 db = get_session(self.config.db_path)
@@ -2471,7 +2532,7 @@ class Arena:
                 finally:
                     db.close()
 
-                lines.append(f"  Tweaks ({len(changes)} params changed):")
+                lines.append(f"  Mutation ({len(changes)} params):")
                 for param, delta in sorted(changes.items()):
                     direction = "up" if delta["pct"] > 0 else "down"
                     obs = MutationMemory.get_observation_count(memory, param) if memory else 0
@@ -2482,13 +2543,22 @@ class Arena:
                         bias_label = " [no history]"
                     lines.append(f"    {param}: {delta['old']} -> {delta['new']} ({direction} {abs(delta['pct']):.1f}%){bias_label}")
 
-                # Explain why these changes should help
-                if metrics.return_pct < 0:
-                    lines.append(f"  Rationale: Lost money in S{session_number}, so applying larger mutations to escape a losing parameter region.")
-                elif metrics.return_pct < 1.0:
-                    lines.append(f"  Rationale: Modest S{session_number} performance. Moderate tweaks to nudge toward better entries/exits without losing what works.")
-                else:
-                    lines.append(f"  Rationale: Strong S{session_number}. Minimal fine-tuning to preserve the winning edge while exploring nearby improvements.")
+            # Net change section
+            if net_changes:
+                lines.append(f"  Net change (start -> final, {len(net_changes)} params):")
+                for param, delta in sorted(net_changes.items()):
+                    direction = "up" if delta["pct"] > 0 else "down"
+                    lines.append(f"    {param}: {delta['old']} -> {delta['new']} ({direction} {abs(delta['pct']):.1f}%)")
+
+            # Rationale
+            if not changes and not adapt_changes:
+                lines.append(f"  Rationale: No changes. Will trade S{session_number + 1} with same config.")
+            elif metrics.return_pct < 0:
+                lines.append(f"  Rationale: Lost money in S{session_number}, so applying larger mutations to escape a losing parameter region.")
+            elif metrics.return_pct < 1.0:
+                lines.append(f"  Rationale: Modest S{session_number} performance. Moderate tweaks to nudge toward better entries/exits without losing what works.")
+            else:
+                lines.append(f"  Rationale: Strong S{session_number}. Minimal fine-tuning to preserve the winning edge while exploring nearby improvements.")
 
             # Watch rules summary
             watch_rules = strategy._watch_rules if strategy else []
@@ -2767,6 +2837,9 @@ class Arena:
             }
             self._self_improve()
             self._generate_improvement_summaries(param_snapshots_2, session_number=2)
+
+        # Note: backtest doesn't call _run_session() so _session_start_params
+        # is not set — adaptation drift will be skipped in summaries.
 
         # Day total
         day_summary = self._compute_day_total(summary_1, summary_2)

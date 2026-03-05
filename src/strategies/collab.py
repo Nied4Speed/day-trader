@@ -135,6 +135,8 @@ class CollabStrategy(Strategy):
         params["sub_params"] = {
             st: sub.get_params() for st, sub in self._sub_strategies.items()
         }
+        # Persist eligible voters so they survive restarts
+        params["_eligible_voters"] = sorted(self._eligible_voters)
         return params
 
     def set_params(self, params: dict) -> None:

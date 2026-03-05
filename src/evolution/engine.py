@@ -56,16 +56,27 @@ class EvolutionEngine:
             logger.warning("No models to evolve")
             return {"error": "no_models"}
 
-        total = len(leaderboard)
-        elimination_count = max(1, int(total * self.config.arena.elimination_rate))
+        # Separate protected models (COLLAB) from competitive pool
+        protected = [m for m in leaderboard if m.strategy_type == "collab"]
+        competitive = [m for m in leaderboard if m.strategy_type != "collab"]
 
-        # Split into survivors and eliminated
-        survivors = leaderboard[:-elimination_count]
-        eliminated = leaderboard[-elimination_count:]
+        if not competitive:
+            logger.warning("No competitive models to evolve")
+            return {"error": "no_competitive_models"}
+
+        total = len(competitive)
+        elimination_count = min(
+            self.config.arena.weekly_elimination_count,
+            max(1, total - 1),  # keep at least 1 survivor
+        )
+
+        # Split competitive models into survivors and eliminated
+        survivors = competitive[:-elimination_count]
+        eliminated = competitive[-elimination_count:]
 
         logger.info(
-            f"Evolution: {total} models, eliminating {elimination_count}, "
-            f"keeping {len(survivors)}"
+            f"Evolution: {total} competitive models (+{len(protected)} protected), "
+            f"eliminating {elimination_count}, keeping {len(survivors)}"
         )
 
         # Mark eliminated models in DB
@@ -108,7 +119,8 @@ class EvolutionEngine:
         offspring_ids = self._persist_offspring(offspring, next_gen)
 
         # Log generation record
-        all_model_ids = survivor_ids + offspring_ids
+        protected_ids = [m.model_id for m in protected]
+        all_model_ids = survivor_ids + offspring_ids + protected_ids
         self._log_generation(
             generation_number=next_gen,
             session_date=session_date,
@@ -118,6 +130,31 @@ class EvolutionEngine:
             offspring_ids=offspring_ids,
             leaderboard=leaderboard,
         )
+
+        # Update COLLAB eligible voters: top 5 performers' strategy types
+        top_5_types = list(dict.fromkeys(
+            m.strategy_type for m in competitive[:5]
+            if m.strategy_type != "collab"
+        ))
+        if top_5_types:
+            db = get_session(self.config.db_path)
+            try:
+                collab_models = (
+                    db.query(TradingModel)
+                    .filter(
+                        TradingModel.strategy_type == "collab",
+                        TradingModel.status == ModelStatus.ACTIVE,
+                    )
+                    .all()
+                )
+                for cm in collab_models:
+                    params = cm.parameters or {}
+                    params["_eligible_voters"] = top_5_types
+                    cm.parameters = params
+                db.commit()
+                logger.info(f"COLLAB voters updated to top 5 types: {top_5_types}")
+            finally:
+                db.close()
 
         summary = {
             "generation": next_gen,
@@ -311,6 +348,7 @@ class EvolutionEngine:
                     genetic_operation=o["genetic_operation"],
                     initial_capital=self.config.arena.initial_capital,
                     current_capital=self.config.arena.initial_capital,
+                    mutation_memory=None,
                 )
                 db.add(model)
                 db.flush()

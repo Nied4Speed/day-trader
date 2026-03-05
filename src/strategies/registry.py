@@ -13,6 +13,8 @@ from src.strategies.vwap_reversion import VWAPReversionStrategy
 from src.strategies.stochastic import StochasticStrategy
 from src.strategies.breakout import BreakoutStrategy
 from src.strategies.mean_reversion import MeanReversionStrategy
+from src.strategies.collab import CollabStrategy
+from src.strategies.news_sentiment import NewsSentimentStrategy
 
 STRATEGY_REGISTRY: dict[str, type[Strategy]] = {
     "ma_crossover": MACrossoverStrategy,
@@ -25,6 +27,8 @@ STRATEGY_REGISTRY: dict[str, type[Strategy]] = {
     "stochastic": StochasticStrategy,
     "breakout": BreakoutStrategy,
     "mean_reversion": MeanReversionStrategy,
+    "news_sentiment": NewsSentimentStrategy,
+    "collab": CollabStrategy,
 }
 
 

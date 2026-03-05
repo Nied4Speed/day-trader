@@ -2,6 +2,7 @@
 
 Computes per-model metrics (P&L, Sharpe, drawdown, win rate) as bars arrive,
 and maintains a ranked leaderboard of all active models.
+Supports per-session tracking (session 1, session 2, day total).
 """
 
 import logging
@@ -51,6 +52,16 @@ class PerformanceTracker:
     def __init__(self, db_path: str):
         self.db_path = db_path
         self._metrics: dict[int, ModelMetrics] = {}
+        self._session_number: int = 1
+        self._session_date: Optional[str] = None
+
+    def set_session_number(self, session_number: int) -> None:
+        """Set which session we're tracking (1 or 2)."""
+        self._session_number = session_number
+
+    def set_session_date(self, session_date: str) -> None:
+        """Set the session date to scope order queries."""
+        self._session_date = session_date
 
     def initialize_models(self, models: list[TradingModel]) -> None:
         """Set up tracking for a list of models at session start."""
@@ -63,6 +74,10 @@ class PerformanceTracker:
                 equity=model.current_capital,
                 equity_curve=[model.current_capital],
             )
+
+    def set_last_prices(self, prices: dict[str, float]) -> None:
+        """Update latest bar prices for unrealized P&L calculation."""
+        self._last_prices = prices
 
     def update(self, model_id: int) -> Optional[ModelMetrics]:
         """Recompute metrics for a model based on current DB state."""
@@ -77,13 +92,18 @@ class PerformanceTracker:
             if not model:
                 return None
 
-            # Get current positions and their unrealized P&L
+            # Get current positions and compute unrealized P&L from latest prices
             positions = (
                 db.query(Position)
                 .filter(Position.model_id == model_id)
                 .all()
             )
-            unrealized = sum(p.unrealized_pnl for p in positions)
+            last_prices = getattr(self, '_last_prices', {})
+            unrealized = 0.0
+            for p in positions:
+                if p.quantity > 0 and p.avg_entry_price > 0:
+                    price = last_prices.get(p.symbol, p.current_price)
+                    unrealized += (price - p.avg_entry_price) * p.quantity
             realized = sum(p.realized_pnl for p in positions)
 
             # Compute equity (capital + unrealized)
@@ -96,31 +116,27 @@ class PerformanceTracker:
             if model.initial_capital > 0:
                 metrics.return_pct = metrics.total_pnl / model.initial_capital * 100
 
-            # Trade stats from filled orders
-            filled_orders = (
-                db.query(Order)
-                .filter(
-                    Order.model_id == model_id,
-                    Order.status == OrderStatus.FILLED,
-                )
-                .all()
+            # Trade stats from filled orders (scoped to current session date)
+            order_query = db.query(Order).filter(
+                Order.model_id == model_id,
+                Order.status == OrderStatus.FILLED,
             )
+            if self._session_date:
+                order_query = order_query.filter(Order.session_date == self._session_date)
+            filled_orders = order_query.all()
             metrics.total_trades = len(filled_orders)
 
-            # Compute per-trade returns from realized position P&L
+            # Compute per-trade returns from individual sell order P&L
             sell_orders = [o for o in filled_orders if o.side.value == "sell"]
             if sell_orders:
-                # Use position realized_pnl as proxy for trade returns
-                trade_returns = []
-                for pos in positions:
-                    if pos.realized_pnl != 0:
-                        # Estimate per-trade return
-                        avg_trade_pnl = pos.realized_pnl / max(1, len(sell_orders))
-                        trade_returns.append(avg_trade_pnl / model.initial_capital)
-                metrics.trade_returns = trade_returns
-                metrics.winning_trades = sum(1 for r in trade_returns if r > 0)
-                if trade_returns:
-                    metrics.win_rate = metrics.winning_trades / len(trade_returns)
+                metrics.trade_returns = [
+                    (o.realized_pnl or 0.0) / model.initial_capital
+                    for o in sell_orders
+                ]
+                metrics.winning_trades = sum(
+                    1 for o in sell_orders if (o.realized_pnl or 0) > 0
+                )
+                metrics.win_rate = metrics.winning_trades / len(sell_orders)
 
             # Compute fitness score
             session_bars = len(metrics.equity_curve)
@@ -171,15 +187,17 @@ class PerformanceTracker:
         """Get metrics for a specific model."""
         return self._metrics.get(model_id)
 
-    def save_snapshots(self, session_date: str) -> None:
+    def save_snapshots(self, session_date: str, session_number: int = 1) -> None:
         """Persist current performance snapshots to DB."""
         db = get_session(self.db_path)
+        now = datetime.utcnow()
         try:
             for metrics in self._metrics.values():
                 snapshot = PerformanceSnapshot(
                     model_id=metrics.model_id,
                     session_date=session_date,
-                    timestamp=datetime.utcnow(),
+                    session_number=session_number,
+                    timestamp=now,
                     equity=metrics.equity,
                     total_pnl=metrics.total_pnl,
                     return_pct=metrics.return_pct,

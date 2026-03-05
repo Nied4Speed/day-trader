@@ -4,12 +4,15 @@ Buys when RSI drops below oversold threshold (assumes bounce),
 sells when RSI rises above overbought threshold (assumes pullback).
 """
 
+import logging
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 
 from src.core.strategy import BarData, Strategy, TradeSignal
+
+logger = logging.getLogger(__name__)
 
 
 class RSIReversionStrategy(Strategy):
@@ -19,7 +22,7 @@ class RSIReversionStrategy(Strategy):
         self.rsi_period: int = 14
         self.oversold: float = 30.0
         self.overbought: float = 70.0
-        self.position_size: int = 1
+        self.allocation_pct: float = 0.25
         super().__init__(name, params)
 
     def _compute_rsi(self, closes: pd.Series) -> float:
@@ -41,6 +44,9 @@ class RSIReversionStrategy(Strategy):
 
     def on_bar(self, bar: BarData) -> Optional[TradeSignal]:
         self.record_bar(bar)
+        liq = self.check_liquidation(bar)
+        if liq:
+            return liq if liq.quantity > 0 else None
         closes = self.get_close_series(bar.symbol)
 
         if len(closes) < self.rsi_period + 1:
@@ -48,19 +54,21 @@ class RSIReversionStrategy(Strategy):
 
         rsi = self._compute_rsi(closes)
 
+        # Cache indicators for watch rule evaluation
+        self._indicators[bar.symbol] = {
+            "close": bar.close,
+            "rsi": rsi,
+        }
+
         if rsi < self.oversold:
-            return TradeSignal(
-                symbol=bar.symbol,
-                side="buy",
-                quantity=self.position_size,
-            )
+            qty = self.compute_quantity(bar.close, self.allocation_pct)
+            if qty > 0:
+                return TradeSignal(symbol=bar.symbol, side="buy", quantity=qty)
 
         if rsi > self.overbought:
-            return TradeSignal(
-                symbol=bar.symbol,
-                side="sell",
-                quantity=self.position_size,
-            )
+            qty = self.compute_quantity(bar.close, self.allocation_pct)
+            if qty > 0:
+                return TradeSignal(symbol=bar.symbol, side="sell", quantity=qty)
 
         return None
 
@@ -69,11 +77,26 @@ class RSIReversionStrategy(Strategy):
             "rsi_period": self.rsi_period,
             "oversold": self.oversold,
             "overbought": self.overbought,
-            "position_size": self.position_size,
+            "allocation_pct": self.allocation_pct,
         }
 
     def set_params(self, params: dict) -> None:
         self.rsi_period = max(2, int(params.get("rsi_period", self.rsi_period)))
         self.oversold = max(5.0, min(45.0, float(params.get("oversold", self.oversold))))
         self.overbought = max(55.0, min(95.0, float(params.get("overbought", self.overbought))))
-        self.position_size = max(1, int(params.get("position_size", self.position_size)))
+        self.allocation_pct = max(0.05, min(1.0, float(params.get("allocation_pct", self.allocation_pct))))
+
+    def adapt(self, recent_signals: list, recent_fills: list, realized_pnl: float) -> None:
+        old_oversold, old_overbought = self.oversold, self.overbought
+        if realized_pnl < 0:
+            self.oversold -= 2
+            self.overbought += 2
+        elif realized_pnl > 0:
+            self.oversold += 1
+            self.overbought -= 1
+        self.oversold = max(15.0, min(40.0, self.oversold))
+        self.overbought = max(60.0, min(85.0, self.overbought))
+        logger.debug(
+            f"{self.name} adapt: oversold {old_oversold}->{self.oversold}, "
+            f"overbought {old_overbought}->{self.overbought}, pnl={realized_pnl:.2f}"
+        )

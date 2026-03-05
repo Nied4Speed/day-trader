@@ -6,10 +6,19 @@ mutate, and spawn strategies without knowing their internals.
 """
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
+import logging
 import pandas as pd
+
+from src.core.watch_rules import (
+    build_watch_context,
+    evaluate_entry_condition,
+    evaluate_watch_condition,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -23,6 +32,24 @@ class BarData:
     low: float
     close: float
     volume: int
+    minutes_remaining: Optional[float] = None  # time left in session
+    news_sentiment: Optional[float] = None  # -1.0 to +1.0, None if unavailable
+    regime: Optional[Any] = None  # RegimeState, set by arena before fan-out
+
+
+@dataclass
+class WatchSignal:
+    """Signal indicating a strategy wants quote-level monitoring for a symbol.
+
+    Returned by get_watch_signals() when a setup is forming but not yet
+    ready for entry. The arena subscribes to quotes for the symbol, and
+    the strategy receives on_watch_quote() calls until entry or TTL expiry.
+    """
+
+    symbol: str
+    reason: str  # human-readable description, e.g. "near breakout threshold"
+    ttl_bars: int = 5  # watch expires after this many bars without conversion
+    context: dict[str, Any] = field(default_factory=dict)  # strategy-specific data
 
 
 @dataclass
@@ -31,9 +58,11 @@ class TradeSignal:
 
     symbol: str
     side: str  # "buy" or "sell"
-    quantity: int
+    quantity: float
     order_type: str = "market"  # "market" or "limit"
     limit_price: Optional[float] = None
+    stop_loss_pct: Optional[float] = None  # e.g., 2.0 = 2% stop-loss
+    take_profit_pct: Optional[float] = None  # e.g., 3.0 = 3% take-profit
 
 
 class Strategy(ABC):
@@ -48,11 +77,47 @@ class Strategy(ABC):
 
     strategy_type: str = "base"
 
+    # Strategies should liquidate when this many minutes remain
+    LIQUIDATION_WINDOW: float = 5.0
+
     def __init__(self, name: str, params: Optional[dict] = None):
         self.name = name
+        self.current_capital: float = 1_000.0
         self._bar_history: dict[str, list[BarData]] = {}
+        self._positions: dict[str, float] = {}  # symbol -> quantity (set by arena)
+        self._entry_prices: dict[str, float] = {}  # symbol -> avg entry price (set by arena)
+        # Risk management params — None means disabled. Strategies opt in by
+        # setting these in their own __init__/set_params.
+        self.stop_loss_pct: Optional[float] = None
+        self.take_profit_pct: Optional[float] = None
+        # LLM-generated watch rules (list of rule dicts)
+        self._watch_rules: list[dict] = []
+        # Cached indicator values per symbol, updated each on_bar()
+        self._indicators: dict[str, dict[str, float]] = {}
         if params:
             self.set_params(params)
+            # Load watch rules from params (set by LLM, not by set_params)
+            self._watch_rules = params.get("_watch_rules", [])
+
+    def compute_quantity(self, price: float, allocation_pct: float = 0.25) -> float:
+        """Compute fractional shares to buy given price and desired capital allocation.
+
+        Alpaca paper trading supports fractional shares for market orders.
+        Returns at least 0.01 shares or $1 notional (whichever is larger),
+        rounded to 4 decimal places.
+        """
+        if price <= 0 or self.current_capital <= 0:
+            return 0.0
+        dollar_amount = self.current_capital * allocation_pct
+        shares = dollar_amount / price
+        # Minimum: max of 0.01 shares or $1 notional
+        min_shares = max(0.01, 1.0 / price)
+        if shares < min_shares:
+            # Can we afford the minimum?
+            if self.current_capital >= min_shares * price:
+                return round(min_shares, 4)
+            return 0.0
+        return round(shares, 4)
 
     @abstractmethod
     def on_bar(self, bar: BarData) -> Optional[TradeSignal]:
@@ -83,6 +148,132 @@ class Strategy(ABC):
         """
         ...
 
+    def get_indicators(self, symbol: str) -> dict[str, float]:
+        """Return current indicator values for the given symbol.
+
+        Subclasses override to expose strategy-specific indicators. Values
+        are cached during on_bar() and read by the generic watch evaluator.
+        Base implementation provides close and has_position.
+        """
+        indicators = self._indicators.get(symbol, {})
+        # Always include base indicators
+        history = self._bar_history.get(symbol, [])
+        if history:
+            indicators.setdefault("close", history[-1].close)
+        indicators["has_position"] = 1.0 if self._positions.get(symbol, 0) > 0 else 0.0
+        return indicators
+
+    def get_watch_signals(self, bar: BarData) -> list[WatchSignal]:
+        """Evaluate LLM-generated watch rules against current indicators.
+
+        Each rule's watch_when condition is checked. If met and no position
+        held, a WatchSignal is created with frozen context values.
+        """
+        if not self._watch_rules:
+            return []
+        if self._positions.get(bar.symbol, 0) > 0:
+            return []
+
+        indicators = self.get_indicators(bar.symbol)
+        signals: list[WatchSignal] = []
+
+        for rule in self._watch_rules:
+            try:
+                if evaluate_watch_condition(rule, indicators):
+                    context = build_watch_context(rule, indicators)
+                    # Tag with rule index so on_watch_quote knows which rule triggered
+                    context["_rule"] = rule
+                    signals.append(WatchSignal(
+                        symbol=bar.symbol,
+                        reason=rule.get("reason", "watch rule triggered"),
+                        ttl_bars=int(rule.get("ttl_bars", 5)),
+                        context=context,
+                    ))
+            except Exception as e:
+                logger.debug(f"Watch rule eval error for {self.name}: {e}")
+
+        return signals
+
+    def on_watch_quote(
+        self,
+        symbol: str,
+        bid: float,
+        ask: float,
+        timestamp,
+        context: dict,
+    ) -> Optional[TradeSignal]:
+        """Evaluate LLM-generated entry condition at quote time.
+
+        Checks the rule's entry_when against mid_price and frozen context.
+        Returns a buy signal if entry condition is met.
+        """
+        rule = context.get("_rule")
+        if not rule:
+            return None
+
+        mid = (bid + ask) / 2.0
+        try:
+            if evaluate_entry_condition(rule, mid, context):
+                qty = self.compute_quantity(mid)
+                if qty > 0:
+                    return TradeSignal(symbol=symbol, side="buy", quantity=qty)
+        except Exception as e:
+            logger.debug(f"Watch entry eval error for {self.name}: {e}")
+
+        return None
+
+    def on_quote(self, symbol: str, bid: float, ask: float, timestamp) -> Optional[TradeSignal]:
+        """Process a real-time quote for exit decisions only.
+
+        Called at quote frequency (per-second) for symbols the model holds.
+        Default implementation checks stop-loss and take-profit against the
+        model's actual entry price.
+
+        Strategies can override for custom exit logic. Must only return sell
+        signals -- quotes are not used for entries.
+
+        Returns a TradeSignal (sell) or None.
+        """
+        qty = self._positions.get(symbol, 0)
+        if qty <= 0:
+            return None
+
+        mid = (bid + ask) / 2.0
+        entry_price = self._entry_prices.get(symbol)
+        if not entry_price or entry_price <= 0:
+            return None
+
+        pct_change = (mid - entry_price) / entry_price * 100.0
+
+        # Stop-loss: exit if price dropped below threshold
+        if self.stop_loss_pct and pct_change <= -self.stop_loss_pct:
+            return TradeSignal(symbol=symbol, side="sell", quantity=qty)
+
+        # Take-profit: exit if price rose above threshold
+        if self.take_profit_pct and pct_change >= self.take_profit_pct:
+            return TradeSignal(symbol=symbol, side="sell", quantity=qty)
+
+        return None
+
+    def check_liquidation(self, bar: BarData) -> Optional[TradeSignal]:
+        """If session is ending and we hold this symbol, sell everything.
+
+        Strategies should call this at the TOP of on_bar(). If it returns
+        a signal, return it immediately — winding down takes priority.
+        """
+        if (
+            bar.minutes_remaining is not None
+            and bar.minutes_remaining <= self.LIQUIDATION_WINDOW
+        ):
+            qty = self._positions.get(bar.symbol, 0)
+            if qty > 0:
+                return TradeSignal(
+                    symbol=bar.symbol, side="sell", quantity=qty
+                )
+            # Don't open new positions in liquidation window
+            return TradeSignal(symbol="__SKIP__", side="sell", quantity=0)
+        return None
+
     def record_bar(self, bar: BarData) -> None:
         """Store a bar in the history buffer for indicator computation."""
         if bar.symbol not in self._bar_history:
@@ -107,9 +298,23 @@ class Strategy(ABC):
             dtype=float,
         )
 
+    def adapt(self, recent_signals: list, recent_fills: list, realized_pnl: float) -> None:
+        """Adapt strategy parameters based on recent intra-session performance.
+
+        Called every 15 bars by the arena. Subclasses override to implement
+        strategy-specific adaptation logic.
+
+        Args:
+            recent_signals: Last 15 bars' TradeSignal objects from this strategy
+            recent_fills: Fill records (dicts with symbol, side, price, qty, pnl)
+            realized_pnl: Total realized P&L in the recent window
+        """
+        pass  # Base class does nothing; subclasses override
+
     def reset(self) -> None:
         """Clear internal state for a new session."""
         self._bar_history.clear()
+        self._indicators.clear()
 
     @classmethod
     def create(cls, name: str, params: Optional[dict] = None) -> "Strategy":

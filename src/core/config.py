@@ -53,8 +53,17 @@ class ArenaConfig:
     llm_watch_rules_model: str = "claude-haiku-4-5-20251001"  # Anthropic model for rule generation
     llm_watch_rules_max: int = 3  # max rules per model
     llm_watch_rules_timeout_sec: int = 10  # API timeout per call
+    synthetic_bar_interval_sec: float = 15.0  # quote aggregation interval; 0 = disabled
     self_improve_enabled: bool = True  # auto-mutate params between sessions
+    cfa_review_enabled: bool = True  # run CFA-style review after last session
+    cfa_review_model: str = "claude-opus-4-20250514"  # Anthropic model for review
+    cfa_review_timeout_sec: int = 120  # API timeout for review call
+    cfa_review_lookback_days: int = 10  # days of history for multi-day trends
     weekly_elimination_count: int = 2  # fixed number of models culled at weekly evolution
+    screener_enabled: bool = True  # run pre-market screener to discover hot symbols
+    screener_max_additions: int = 20  # max dynamic symbols to add on top of core list
+    screener_min_price: float = 5.0  # skip stocks below this price
+    screener_interval_minutes: int = 15  # re-run screener every N minutes during session (0=once at start only)
     symbols: list[str] = field(default_factory=lambda: [
         "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA",
         "META", "TSLA", "JPM", "V", "SPY",

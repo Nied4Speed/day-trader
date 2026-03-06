@@ -241,6 +241,19 @@ class DailyLedger(Base):
     )
 
 
+class CfaReview(Base):
+    """Daily CFA-style review of trading performance."""
+
+    __tablename__ = "cfa_reviews"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_date = Column(String(10), nullable=False, unique=True, index=True)
+    review_json = Column(JSON, nullable=True)
+    raw_response = Column(Text, nullable=True)
+    model_used = Column(String(100), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
 class SessionRecord(Base):
     """Record of a trading session (two per day: session 1 and session 2)."""
 

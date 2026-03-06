@@ -19,6 +19,7 @@ from datetime import datetime, time, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
+from src.core.cfa_review import run_cfa_review
 from src.core.config import Config
 from src.core.database import (
     DailyLedger,
@@ -37,8 +38,9 @@ from src.core.performance import PerformanceTracker
 from src.core.position_manager import ModelSignal, PositionManager
 from src.core.regime import RegimeDetector
 from src.core.strategy import BarData, Strategy, TradeSignal, WatchSignal
-from src.data.feed import AlpacaDataFeed
+from src.data.feed import AlpacaDataFeed, QuoteAggregator
 from src.data.news_feed import AlpacaNewsFeed
+from src.data.screener import SymbolScreener
 from src.strategies.registry import create_strategy
 
 logger = logging.getLogger(__name__)
@@ -82,6 +84,8 @@ class Arena:
         self._watch_subscribed: set[str] = set()  # symbols subscribed for watch quotes
         self._last_watch_dispatch: dict[tuple, float] = {}  # (model_id, symbol) -> last dispatch time
         self._watch_stats: dict[str, int] = {"created": 0, "expired": 0, "converted": 0}
+        # Quote aggregator for synthetic bars (created per session)
+        self._quote_aggregator: Optional[QuoteAggregator] = None
 
     def _set_status(self, phase: str, detail: str = "", bar: int | None = None, total_bars: int | None = None) -> None:
         """Write current arena phase to a status file for the dashboard."""
@@ -496,13 +500,17 @@ class Arena:
         if not bars:
             return
 
+        is_synthetic = bars[0].synthetic
         n_bars = len(bars)
-        self._bar_count += n_bars
-        self._adapt_bar_count += n_bars
-        self._set_status("session", f"Session {self._session_number} trading", bar=self._bar_count)
         session_date = self._session_date
 
-        # Set time remaining on each bar
+        # Only advance counters / status for real bars
+        if not is_synthetic:
+            self._bar_count += n_bars
+            self._adapt_bar_count += n_bars
+            self._set_status("session", f"Session {self._session_number} trading", bar=self._bar_count)
+
+        # Set time remaining on each bar (needed for check_liquidation even on synthetic)
         if self._session_start_time:
             session_mins = self._current_session_minutes or self.config.arena.session_1_minutes
             elapsed = self._session_elapsed_minutes()
@@ -515,24 +523,32 @@ class Arena:
             for bar in bars:
                 bar.minutes_remaining = None
 
-        # Fetch news sentiment once per batch (not per bar)
-        logger.info(f"[BATCH-DBG] start batch {n_bars} bars, bar_count={self._bar_count}")
-        if self._bar_count % self.config.arena.news_fetch_interval < n_bars:
-            try:
-                logger.info("[BATCH-DBG] fetching news...")
-                self._news_sentiment = await asyncio.to_thread(
-                    self.news_feed.fetch_news,
-                    self.config.arena.symbols,
-                    self.config.arena.news_lookback_minutes,
-                )
-                logger.info("[BATCH-DBG] news done")
-            except Exception:
-                logger.exception("Failed to fetch news sentiment")
+        # News and regime only on real bars
+        if not is_synthetic:
+            # Fetch news sentiment once per batch (not per bar)
+            logger.info(f"[BATCH-DBG] start batch {n_bars} bars, bar_count={self._bar_count}")
+            if self._bar_count % self.config.arena.news_fetch_interval < n_bars:
+                try:
+                    logger.info("[BATCH-DBG] fetching news...")
+                    self._news_sentiment = await asyncio.to_thread(
+                        self.news_feed.fetch_news,
+                        self.config.arena.symbols,
+                        self.config.arena.news_lookback_minutes,
+                    )
+                    logger.info("[BATCH-DBG] news done")
+                except Exception:
+                    logger.exception("Failed to fetch news sentiment")
+        else:
+            logger.info(f"[SYNTH] {n_bars} synthetic bars")
 
-        # Set news sentiment and regime on each bar (cheap, CPU-only)
+        # Set news sentiment and regime on each bar
         for bar in bars:
             bar.news_sentiment = self._news_sentiment.get(bar.symbol)
-            bar.regime = self.regime_detector.update(bar)
+            if is_synthetic:
+                # Carry forward last known regime — don't update ADX/ATR with mid-price data
+                bar.regime = self.regime_detector.get_regime(bar.symbol)
+            else:
+                bar.regime = self.regime_detector.update(bar)
 
         # Collect signals from all bars × all models in one thread call
         model_signals: list[ModelSignal] = []
@@ -639,15 +655,15 @@ class Arena:
         else:
             logger.info("[BATCH-DBG] no orders to submit")
 
-        # Intra-session adaptation
-        if self._adapt_bar_count >= self._adapt_interval:
+        # Intra-session adaptation (real bars only)
+        if not is_synthetic and self._adapt_bar_count >= self._adapt_interval:
             self._adapt_bar_count = 0
             logger.info("[BATCH-DBG] running adaptation...")
             await asyncio.to_thread(self._run_adaptation)
             logger.info("[BATCH-DBG] adaptation done")
 
-        # Watch signals from all bars
-        if not self._is_in_liquidation_window():
+        # Watch signals from all bars (real bars only)
+        if not is_synthetic and not self._is_in_liquidation_window():
             for bar in bars:
                 for model_id, strategy in self._models.items():
                     try:
@@ -657,29 +673,31 @@ class Arena:
                     except Exception:
                         logger.exception(f"Error getting watch signals from model {model_id}")
 
-        self._tick_watches()
+        if not is_synthetic:
+            self._tick_watches()
         # NOTE: _update_quote_subscriptions() intentionally skipped in batch mode.
         # subscribe_quotes() on the Alpaca StockDataStream deadlocks the event loop
         # when called while _run_forever() is processing messages. Stop-loss/take-profit
         # logic in on_bar() handles exits without real-time quotes.
 
-        # Snapshot once per batch
-        interval = self.config.arena.snapshot_interval
-        if self._bar_count % interval < n_bars:
-            last_prices = dict(self.execution._last_prices)
-            session_date = self._session_date
-            session_number = self._session_number
+        # Snapshot once per batch (real bars only)
+        if not is_synthetic:
+            interval = self.config.arena.snapshot_interval
+            if self._bar_count % interval < n_bars:
+                last_prices = dict(self.execution._last_prices)
+                session_date = self._session_date
+                session_number = self._session_number
 
-            def _snapshot():
-                self.tracker.set_last_prices(last_prices)
-                self.tracker.update_all()
-                self.tracker.save_snapshots(session_date, session_number)
+                def _snapshot():
+                    self.tracker.set_last_prices(last_prices)
+                    self.tracker.update_all()
+                    self.tracker.save_snapshots(session_date, session_number)
 
-            logger.info("[BATCH-DBG] saving snapshot...")
-            await asyncio.to_thread(_snapshot)
-            logger.info("[BATCH-DBG] snapshot done")
+                logger.info("[BATCH-DBG] saving snapshot...")
+                await asyncio.to_thread(_snapshot)
+                logger.info("[BATCH-DBG] snapshot done")
 
-        logger.info(f"[BATCH-DBG] batch complete, bar_count={self._bar_count}")
+        logger.info(f"[BATCH-DBG] batch complete, bar_count={self._bar_count}" + (" [synthetic]" if is_synthetic else ""))
 
     def _update_position_manager_state(self) -> None:
         """Sync portfolio state into the PositionManager for risk checks."""
@@ -1126,6 +1144,93 @@ class Arena:
         if closed or alpaca_closed:
             self.tracker.update_all()
 
+    def _run_screener(self) -> list[str]:
+        """Run the symbol screener to expand the trading universe.
+
+        Queries Alpaca for top most-active stocks by volume, applies a price
+        floor, and extends ``self.config.arena.symbols`` with the results.
+        Safe to call multiple times (deduplicates).  Returns the list of
+        newly added symbols (empty on failure or no new finds).
+        """
+        if not self.config.arena.screener_enabled:
+            return []
+
+        try:
+            screener = SymbolScreener(self.config)
+            new_symbols = screener.screen()
+            if new_symbols:
+                existing = set(self.config.arena.symbols)
+                to_add = [s for s in new_symbols if s not in existing]
+                if to_add:
+                    self.config.arena.symbols.extend(to_add)
+                    logger.info(
+                        f"Screener added {len(to_add)} symbols: {to_add} "
+                        f"(total: {len(self.config.arena.symbols)})"
+                    )
+                    return to_add
+            else:
+                logger.info("Screener returned no new symbols")
+        except Exception:
+            logger.exception("Screener failed (non-fatal, continuing with existing symbols)")
+        return []
+
+    def _warmup_symbols(self, symbols: list[str]) -> None:
+        """Feed recent historical bars for specific symbols through all strategies.
+
+        Used for mid-session warmup when the screener discovers new symbols.
+        """
+        warmup_count = self.config.arena.warmup_bars
+        try:
+            now = datetime.now(ET)
+            days_back = max(3, warmup_count // 200 + 2)
+            historical = self.feed.fetch_historical_bars(
+                symbols, days_back=days_back, end_date=now,
+            )
+            total_fed = 0
+            for symbol in symbols:
+                bars = historical.get(symbol, [])
+                bars.sort(key=lambda b: b.timestamp)
+                for bar in bars[-warmup_count:]:
+                    bar.minutes_remaining = None
+                    for strategy in self._models.values():
+                        try:
+                            strategy.record_bar(bar)
+                            strategy.on_bar(bar)
+                        except Exception:
+                            pass
+                    total_fed += 1
+            logger.info(f"Mid-session warmup: fed {total_fed} bars for {symbols}")
+        except Exception:
+            logger.exception(f"Mid-session warmup failed for {symbols} (non-fatal)")
+
+    async def _periodic_screener(self) -> None:
+        """Periodically re-run the screener during a session to discover new symbols.
+
+        When new symbols are found, subscribes to their bar/quote streams and
+        runs a quick historical warmup so strategies have indicator data.
+        """
+        interval = self.config.arena.screener_interval_minutes
+        if not self.config.arena.screener_enabled or interval <= 0:
+            return
+
+        while self._running:
+            await asyncio.sleep(interval * 60)
+            if not self._running:
+                break
+
+            logger.info("Periodic screener: checking for new symbols...")
+            new_symbols = await asyncio.to_thread(self._run_screener)
+            if not new_symbols:
+                continue
+
+            # Subscribe to bar + quote streams for new symbols
+            self.feed.subscribe_bars(new_symbols)
+            if self._quote_aggregator:
+                self.feed.subscribe_quotes(new_symbols)
+
+            # Warm up strategies with historical data for new symbols
+            await asyncio.to_thread(self._warmup_symbols, new_symbols)
+
     def _warmup_strategies(self) -> None:
         """Feed recent historical bars through strategies without placing orders.
 
@@ -1184,7 +1289,11 @@ class Arena:
         # Step 1: Wait until pre-market start time
         await self._wait_until_et(pm_hour, pm_minute)
 
-        # Step 2: Historical warmup (existing behavior)
+        # Step 2: Screener (expand symbol universe before warmup)
+        self._set_status("screener", "Running pre-market symbol screener")
+        self._run_screener()
+
+        # Step 3: Historical warmup (existing behavior)
         self._set_status("warmup", f"Historical warmup ({cfg.warmup_bars} bars)")
         self._warmup_strategies()
 
@@ -1373,6 +1482,72 @@ class Arena:
             logger.exception("Failed to save daily ledger")
         finally:
             db.close()
+
+    async def _run_cfa_review(self) -> None:
+        """Run CFA-style post-day review (non-fatal)."""
+        if not self.config.arena.cfa_review_enabled:
+            logger.info("CFA review disabled, skipping")
+            return
+
+        self._set_status("reviewing", "Running CFA review")
+        try:
+            review = await asyncio.to_thread(
+                run_cfa_review,
+                self.config.db_path,
+                self._session_date,
+                self.config.arena.cfa_review_model,
+                self.config.arena.cfa_review_timeout_sec,
+                self.config.arena.cfa_review_lookback_days,
+            )
+            if review:
+                self._print_cfa_review(review)
+            else:
+                logger.warning("CFA Review returned no result")
+        except Exception:
+            logger.exception("CFA Review failed (non-fatal)")
+
+    def _print_cfa_review(self, review: dict) -> None:
+        """Print CFA review highlights to the console."""
+        grade = review.get("portfolio_grade", "?")
+        justification = review.get("portfolio_grade_justification", "")
+        summary = review.get("executive_summary", "")
+        red_flags = review.get("red_flags", [])
+        action_items = review.get("action_items", [])
+        next_day = review.get("next_day_recommendations", "")
+        md_path = f"logs/cfa_review_{self._session_date}.md"
+
+        divider = "=" * 60
+        print(f"\n{divider}")
+        print(f"  CFA DAILY REVIEW — {self._session_date}")
+        print(f"  Grade: {grade} — {justification}")
+        print(divider)
+        print(f"\n{summary}\n")
+
+        if red_flags:
+            print("RED FLAGS:")
+            for flag in red_flags:
+                print(f"  !! {flag}")
+            print()
+
+        if action_items:
+            print("ACTION ITEMS:")
+            for item in action_items:
+                if isinstance(item, dict):
+                    prio = item.get("priority", "medium").upper()
+                    print(f"  [{prio}] {item.get('action', '')}")
+                    print(f"         {item.get('rationale', '')}")
+                else:
+                    print(f"  - {item}")
+            print()
+
+        if next_day:
+            print("TOMORROW:")
+            print(f"  {next_day}\n")
+
+        print(f"Full report: {md_path}")
+        print(f"{divider}\n")
+
+        logger.info(f"CFA Review complete — Grade: {grade}")
 
     def _evaluate_pending_mutations(self) -> None:
         """Evaluate whether pending mutations improved performance.
@@ -1630,10 +1805,22 @@ class Arena:
         else:
             # Live mode: use batched processing to keep event loop responsive
             self.feed.on_bar_batch(self._fan_out_bars)
-            # NOTE: on_quote disabled — _on_quote does sync DB + order submission
-            # on the event loop, causing deadlocks. Stop-loss/take-profit handled
-            # in on_bar() instead. Trade updates kept for fill tracking.
+            # NOTE: old on_quote handler disabled — it did sync DB + order submission
+            # on the event loop, causing deadlocks. The new QuoteAggregator.on_quote
+            # is purely synchronous list.append(), so it's safe to register.
             self.feed.on_trade_update(self._on_trade_update)
+
+            # Synthetic bars from quote aggregation
+            synth_interval = self.config.arena.synthetic_bar_interval_sec
+            if synth_interval > 0:
+                self._quote_aggregator = QuoteAggregator(interval_sec=synth_interval)
+                self._quote_aggregator.set_callback(self._fan_out_bars)
+                self.feed.on_quote(self._quote_aggregator.on_quote)
+                self.feed.subscribe_quotes(self.config.arena.symbols)
+                logger.info(
+                    f"Synthetic bars enabled: {synth_interval}s interval, "
+                    f"{len(self.config.arena.symbols)} symbols"
+                )
 
         total_expected = session_minutes  # rough: ~1 bar per minute
         self._set_status("session", f"Session {session_number} streaming", bar=0, total_bars=total_expected)
@@ -1646,19 +1833,28 @@ class Arena:
             await self.feed.stop_streaming()
 
         timer_task = asyncio.create_task(_session_timer())
+        screener_task = asyncio.create_task(self._periodic_screener())
         try:
+            # Start aggregator timer before streaming so it's ready for quotes
+            if self._quote_aggregator:
+                self._quote_aggregator.start()
             # Directly await start_streaming (not via create_task) so the
             # Alpaca SDK's _run_forever runs in the top-level gather context.
             await self.feed.start_streaming(self.config.arena.symbols)
         except asyncio.CancelledError:
             logger.info(f"Session {session_number} cancelled")
         finally:
-            if not timer_task.done():
-                timer_task.cancel()
-                try:
-                    await timer_task
-                except asyncio.CancelledError:
-                    pass
+            # Stop aggregator before streams to prevent flush after stream close
+            if self._quote_aggregator:
+                self._quote_aggregator.stop()
+                self._quote_aggregator = None
+            for task in (timer_task, screener_task):
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
             # Ensure streams are stopped even on unexpected exit
             await self.feed.stop_streaming()
         self._quote_subscribed.clear()
@@ -1844,6 +2040,9 @@ class Arena:
             # Save daily ledger
             self._save_daily_ledger()
 
+            # CFA review
+            await self._run_cfa_review()
+
         except KeyboardInterrupt:
             logger.info("Arena interrupted by user")
         finally:
@@ -1873,6 +2072,7 @@ class Arena:
             self._set_status("premarket", "Pre-market warmup in progress")
             await self._premarket_warmup()
         else:
+            self._run_screener()
             self._warmup_strategies()
 
         # Override configured session durations
@@ -1940,6 +2140,9 @@ class Arena:
                 self._print_summary(summaries[0], "DAY TOTAL")
 
             self._save_daily_ledger()
+
+            # CFA review
+            await self._run_cfa_review()
 
         except asyncio.CancelledError:
             logger.info("Arena custom run cancelled — liquidating positions")
@@ -2084,8 +2287,19 @@ class Arena:
             self.feed.on_bar(self._fan_out_bar)
         else:
             self.feed.on_bar_batch(self._fan_out_bars)
-            # on_quote disabled — causes event loop deadlock (see main session path)
             self.feed.on_trade_update(self._on_trade_update)
+
+            # Synthetic bars from quote aggregation (pipeline test)
+            synth_interval = self.config.arena.synthetic_bar_interval_sec
+            if synth_interval > 0:
+                self._quote_aggregator = QuoteAggregator(interval_sec=synth_interval)
+                self._quote_aggregator.set_callback(self._fan_out_bars)
+                self.feed.on_quote(self._quote_aggregator.on_quote)
+                self.feed.subscribe_quotes(self.config.arena.symbols)
+                logger.info(
+                    f"Synthetic bars enabled (pipeline test): {synth_interval}s interval, "
+                    f"{len(self.config.arena.symbols)} symbols"
+                )
 
         self._set_status("pipeline-test", f"Streaming ({test_duration_min} min)")
         logger.info(f"Pipeline test: streaming for {test_duration_min} minutes...")
@@ -2116,10 +2330,15 @@ class Arena:
         timer_task = asyncio.create_task(_pipeline_timer())
         monitor_task = asyncio.create_task(_progress_monitor())
         try:
+            if self._quote_aggregator:
+                self._quote_aggregator.start()
             await self.feed.start_streaming(self.config.arena.symbols)
         except asyncio.CancelledError:
             logger.info("Pipeline test: cancelled")
         finally:
+            if self._quote_aggregator:
+                self._quote_aggregator.stop()
+                self._quote_aggregator = None
             for t in [timer_task, monitor_task]:
                 if not t.done():
                     t.cancel()
@@ -2177,6 +2396,7 @@ class Arena:
             logger.warning("Outside market hours.")
 
         self._prepare()
+        self._run_screener()
         self._warmup_strategies()
 
         try:

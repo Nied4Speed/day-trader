@@ -22,8 +22,10 @@ from pydantic import BaseModel, Field
 
 from src.core.arena import Arena
 from src.core.config import Config
+from src.core.cfa_review import run_cfa_review
 from src.core.database import (
     Bar,
+    CfaReview,
     GenerationRecord,
     ModelStatus,
     ModelSummary,
@@ -840,6 +842,65 @@ async def arena_stop():
 
     logger.info("Arena stopped via API")
     return {"status": "stopped"}
+
+
+@app.get("/api/cfa-review/{session_date}")
+async def get_cfa_review(session_date: str):
+    """Retrieve a saved CFA review for a given date."""
+    db = get_dashboard_session(DB_PATH)
+    try:
+        review = (
+            db.query(CfaReview)
+            .filter(CfaReview.session_date == session_date)
+            .first()
+        )
+        if not review:
+            raise HTTPException(status_code=404, detail="No review found for this date")
+        return {
+            "session_date": review.session_date,
+            "review": review.review_json,
+            "model_used": review.model_used,
+            "created_at": review.created_at.isoformat() if review.created_at else None,
+        }
+    finally:
+        db.close()
+
+
+@app.post("/api/cfa-review/{session_date}/generate")
+async def generate_cfa_review(session_date: str):
+    """Manually trigger or re-run a CFA review for a given date."""
+    config = Config.load()
+    try:
+        loop = asyncio.get_event_loop()
+        review = await asyncio.wait_for(
+            loop.run_in_executor(
+                _get_api_executor(),
+                run_cfa_review,
+                config.db_path,
+                session_date,
+                config.arena.cfa_review_model,
+                config.arena.cfa_review_timeout_sec,
+                config.arena.cfa_review_lookback_days,
+            ),
+            timeout=float(config.arena.cfa_review_timeout_sec + 30),
+        )
+        if review is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Review generation failed (check logs for details)",
+            )
+        return {
+            "session_date": session_date,
+            "review": review,
+            "status": "generated",
+        }
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Review generation timed out")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("CFA review generation failed")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.websocket("/ws")

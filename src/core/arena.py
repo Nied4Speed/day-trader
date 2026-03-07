@@ -203,35 +203,9 @@ class Arena:
                     _ = m.initial_capital, m.current_capital, m.status
                     db.expunge(m)
 
-            # Ensure COLLAB model exists
-            collab_exists = any(m.strategy_type == "collab" for m in active_models)
-            if not collab_exists:
-                logger.info("Creating COLLAB ensemble model")
-                sub_params = {}
-                for m in active_models:
-                    if m.strategy_type != "collab" and m.strategy_type not in sub_params:
-                        sub_params[m.strategy_type] = m.parameters or {}
-
-                collab_strategy = create_strategy("collab", "COLLAB", params={"sub_params": sub_params})
-                gen = active_models[0].generation if active_models else 1
-
-                collab_model = TradingModel(
-                    name="COLLAB",
-                    strategy_type="collab",
-                    parameters=collab_strategy.get_params(),
-                    generation=gen,
-                    initial_capital=self.config.arena.initial_capital,
-                    current_capital=self.config.arena.initial_capital,
-                )
-                db.add(collab_model)
-                db.commit()
-                db.refresh(collab_model)
-                _ = collab_model.id, collab_model.name, collab_model.strategy_type
-                _ = collab_model.parameters, collab_model.generation
-                _ = collab_model.initial_capital, collab_model.current_capital, collab_model.status
-                db.expunge(collab_model)
-                active_models.append(collab_model)
-                logger.info(f"COLLAB model created with id={collab_model.id}")
+            # COLLAB auto-creation disabled — needs redesign as between-session
+            # hybrid synthesis rather than real-time voting ensemble.
+            # See TODO #2 in MEMORY.md.
 
             return active_models
 
@@ -583,6 +557,10 @@ class Arena:
                                     )
                                 )
                                 self._recent_signals.setdefault(model_id, []).append(signal)
+                                # Pre-deduct capital so next signal sees reduced balance
+                                if signal.side == "buy":
+                                    est_price = self.execution._last_prices.get(signal.symbol, bar.close)
+                                    strategy.current_capital -= signal.quantity * est_price
                     except Exception:
                         logger.exception(f"Error processing bar for model {model_id}")
 
@@ -616,6 +594,10 @@ class Arena:
                 symbol=order.symbol, side=order.side, quantity=order.quantity
             )
             self.position_manager.lock_symbol(order.symbol)
+            # Pre-deduct capital before submission so subsequent risk checks see reduced balance
+            if signal.side == "buy":
+                est_price = self.execution._last_prices.get(order.symbol, 100)
+                self._models[primary_model].current_capital -= signal.quantity * est_price
             async_tasks.append(
                 self.execution.async_submit_order(
                     model_id=primary_model,
@@ -1224,9 +1206,20 @@ class Arena:
                 continue
 
             # Subscribe to bar + quote streams for new symbols
-            self.feed.subscribe_bars(new_symbols)
-            if self._quote_aggregator:
-                self.feed.subscribe_quotes(new_symbols)
+            # Run in thread — Alpaca SDK subscribe can block if stream is degraded
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(self.feed.subscribe_bars, new_symbols),
+                    timeout=10.0,
+                )
+                if self._quote_aggregator:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(self.feed.subscribe_quotes, new_symbols),
+                        timeout=10.0,
+                    )
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.error(f"Periodic screener: subscribe failed: {e!r}")
+                continue
 
             # Warm up strategies with historical data for new symbols
             await asyncio.to_thread(self._warmup_symbols, new_symbols)
@@ -1412,20 +1405,33 @@ class Arena:
         try:
             from sqlalchemy import func
 
+            from src.core.database import Order, OrderStatus, OrderSide
+
             for model_id, model_record in self._model_records.items():
                 db_model = db.query(TradingModel).get(model_id)
                 if not db_model:
                     continue
 
-                end_capital = db_model.current_capital
                 start_capital = db_model.initial_capital
+
+                # Use realized PnL from filled sell orders (source of truth)
+                realized_pnl = (
+                    db.query(func.sum(Order.realized_pnl))
+                    .filter(
+                        Order.model_id == model_id,
+                        Order.session_date == self._session_date,
+                        Order.status == OrderStatus.FILLED,
+                        Order.side == OrderSide.SELL,
+                    )
+                    .scalar() or 0.0
+                )
+                end_capital = start_capital + realized_pnl
                 daily_return = (
-                    (end_capital - start_capital) / start_capital * 100
+                    realized_pnl / start_capital * 100
                     if start_capital > 0 else 0.0
                 )
 
                 # Count trades for today
-                from src.core.database import Order, OrderStatus
                 trade_count = (
                     db.query(func.count(Order.id))
                     .filter(
@@ -2048,23 +2054,55 @@ class Arena:
         finally:
             self._running = False
 
-    async def run_custom(self, num_sessions: int, session_minutes: int) -> None:
+    async def run_custom(
+        self,
+        num_sessions: int,
+        session_minutes: int,
+        resume: bool = False,
+        skip_cfa: bool = False,
+    ) -> None:
         """Run N sessions of configurable duration with reflection between each.
 
         Args:
             num_sessions: Number of sessions to run (1-20).
-            session_minutes: Duration of each session in minutes (5-360).
+            session_minutes: Duration of each session in minutes (5-390).
+            resume: If True, skip capital reset and position cleanup; restore
+                    model state from DB so models continue with existing positions.
+            skip_cfa: If True, skip the post-session CFA review.
         """
         logger.info(
             f"Arena starting custom run: {num_sessions} sessions x "
             f"{session_minutes} min each"
+            + (" (RESUME)" if resume else "")
         )
         self._set_status("starting", "Initializing arena (custom run)")
 
-        self._prepare()
+        if resume:
+            # Resume mode: init DB, set date, load models WITHOUT resetting capital
+            init_db(self.config.db_path)
+            self._session_date = datetime.now(ET).strftime("%Y-%m-%d")
+            self._running = True
+            loop = asyncio.get_running_loop()
+            loop.set_default_executor(ThreadPoolExecutor(max_workers=32))
+            models = self._load_or_create_models()
+            self._instantiate_strategies(models)
 
-        # Clean up stale Alpaca state before starting
-        await asyncio.to_thread(self._clean_alpaca_state)
+            # Restore positions + capital from DB (positions survive across restarts)
+            for model_id, strategy in self._models.items():
+                self._refresh_model_state(model_id, strategy)
+            # Log restored state
+            total_positions = sum(
+                len(s._positions) for s in self._models.values()
+            )
+            logger.info(
+                f"Resume: restored {len(self._models)} models with "
+                f"{total_positions} open positions from DB"
+            )
+        else:
+            self._prepare()
+
+            # Clean up stale Alpaca state before starting
+            await asyncio.to_thread(self._clean_alpaca_state)
 
         # Pre-market warmup (historical + live SIP polling) then wait for 9:30
         now_et = datetime.now(ET)
@@ -2099,6 +2137,7 @@ class Arena:
                     f"Generating S{session_number} reflections",
                 )
                 self._generate_session_summaries(session_number)
+                self._save_daily_ledger()  # Save BEFORE self-improvement can crash
 
                 if self.config.arena.self_improve_enabled:
                     self._set_status(
@@ -2142,7 +2181,10 @@ class Arena:
             self._save_daily_ledger()
 
             # CFA review
-            await self._run_cfa_review()
+            if skip_cfa:
+                logger.info("CFA review skipped (skip_cfa=True)")
+            else:
+                await self._run_cfa_review()
 
         except asyncio.CancelledError:
             logger.info("Arena custom run cancelled — liquidating positions")

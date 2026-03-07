@@ -24,7 +24,7 @@ class AlpacaConfig:
 
 @dataclass
 class ArenaConfig:
-    model_count: int = 19  # 19 competitive + 1 COLLAB = 20 total
+    model_count: int = 12  # competitive models (COLLAB disabled pending redesign)
     initial_capital: float = 1_000.0
     transaction_cost_pct: float = 0.0  # Alpaca is commission-free
     slippage_bps: float = 5.0  # simulated slippage in basis points (5 bps = 0.05%)

@@ -58,6 +58,8 @@ class ExecutionHandler:
         self._pending_orders: dict[str, dict] = {}
         # Retry stats
         self.retry_stats: dict[str, int] = {"buy_retries": 0, "sell_retries": 0, "buy_retry_success": 0, "sell_retry_success": 0}
+        # Fractionable cache: symbol -> bool (lazily populated)
+        self._fractionable_cache: dict[str, bool] = {}
 
     @property
     def client(self) -> TradingClient:
@@ -209,10 +211,11 @@ class ExecutionHandler:
 
         # Check that buy orders don't exceed available capital
         if signal.side == "buy":
-            estimated_cost = signal.quantity * (signal.limit_price or 0)
-            if estimated_cost == 0:
-                estimated_cost = signal.quantity * 100  # placeholder
-            if estimated_cost > current_capital * 1.5:  # allow some margin
+            if signal.limit_price:
+                estimated_cost = signal.quantity * signal.limit_price
+            else:
+                estimated_cost = signal.quantity * self._last_prices.get(signal.symbol, 100)
+            if estimated_cost > current_capital:
                 raise RiskLimitExceeded(
                     f"Model {model_id} order cost {estimated_cost:.2f} "
                     f"exceeds available capital {current_capital:.2f}"
@@ -463,6 +466,24 @@ class ExecutionHandler:
             self.submit_order, model_id, signal, current_capital, session_date
         )
 
+    def _is_fractionable(self, symbol: str) -> bool:
+        """Check if a symbol supports fractional shares on Alpaca.
+
+        Results are cached for the lifetime of this handler.
+        """
+        if symbol in self._fractionable_cache:
+            return self._fractionable_cache[symbol]
+
+        try:
+            asset = self.client.get_asset(symbol)
+            result = bool(asset.fractionable)
+        except Exception:
+            logger.warning(f"Could not check fractionable for {symbol}, assuming False")
+            result = False
+
+        self._fractionable_cache[symbol] = result
+        return result
+
     def _build_order_request(self, signal: TradeSignal, alpaca_side):
         """Build an Alpaca order request from a TradeSignal.
 
@@ -474,17 +495,22 @@ class ExecutionHandler:
         # manual sells (wash trade rejections + insufficient qty holds).
 
         # Simple order (market or limit)
-        # Alpaca only supports fractional shares on market orders.
-        # For limit orders, round up to whole shares.
+        # Alpaca only supports fractional shares on market orders for
+        # fractionable symbols.  Round to whole shares otherwise.
+        qty = signal.quantity
         if signal.order_type == "limit" and signal.limit_price:
-            whole_qty = max(1, int(signal.quantity + 0.999))  # ceil
+            whole_qty = max(1, int(qty + 0.999))  # ceil
             return LimitOrderRequest(
                 symbol=signal.symbol, qty=whole_qty,
                 side=alpaca_side, time_in_force=TimeInForce.DAY,
                 limit_price=signal.limit_price,
             )
+
+        # Market order: use fractional qty only if symbol supports it
+        if not self._is_fractionable(signal.symbol):
+            qty = max(1, int(qty))  # floor to whole shares, min 1
         return MarketOrderRequest(
-            symbol=signal.symbol, qty=signal.quantity,
+            symbol=signal.symbol, qty=qty,
             side=alpaca_side, time_in_force=TimeInForce.DAY,
         )
 

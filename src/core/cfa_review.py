@@ -74,20 +74,56 @@ def _gather_review_data(
             fitness = summary.fitness if summary else None
             rank = summary.rank if summary else None
 
+            # Use daily_ledger for accurate capital (m.current_capital resets)
+            ledger = (
+                db.query(DailyLedger)
+                .filter(
+                    DailyLedger.model_id == m.id,
+                    DailyLedger.session_date == session_date,
+                )
+                .first()
+            )
+            start_cap = ledger.start_capital if ledger else m.initial_capital
+            end_cap = ledger.end_capital if ledger else m.current_capital
+            daily_ret = ledger.daily_return_pct if ledger else return_pct
+
+            # Per-model realized PnL from orders (permanent, survives resets)
+            model_realized = (
+                db.query(func.sum(Order.realized_pnl))
+                .filter(
+                    Order.model_id == m.id,
+                    Order.session_date == session_date,
+                    Order.status == OrderStatus.FILLED,
+                    Order.side == OrderSide.SELL,
+                )
+                .scalar() or 0.0
+            )
+
+            # Parse model parameters for risk control visibility
+            params = {}
+            if m.parameters:
+                try:
+                    params = json.loads(m.parameters) if isinstance(m.parameters, str) else m.parameters
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
             model_rows.append({
                 "id": m.id,
                 "name": m.name,
                 "strategy_type": m.strategy_type,
                 "generation": m.generation,
-                "return_pct": round(return_pct, 4),
+                "return_pct": round(daily_ret, 4),
                 "sharpe": round(sharpe, 4) if sharpe else 0.0,
                 "max_drawdown": round(drawdown, 4),
                 "win_rate": round(win_rate, 4),
                 "trades": trades,
                 "fitness": round(fitness, 4) if fitness else None,
                 "rank": rank,
-                "start_capital": m.initial_capital,
-                "end_capital": m.current_capital,
+                "start_capital": round(start_cap, 2),
+                "end_capital": round(end_cap, 2),
+                "realized_pnl": round(model_realized, 2),
+                "stop_loss_pct": params.get("stop_loss_pct"),
+                "take_profit_pct": params.get("take_profit_pct"),
             })
 
         model_rows.sort(key=lambda r: r["return_pct"], reverse=True)
@@ -348,11 +384,15 @@ def _build_review_prompt(data: dict[str, Any]) -> str:
 
     return f"""\
 You are a CFA charterholder and portfolio risk analyst reviewing the daily results
-of an evolutionary trading arena. The arena runs 20 AI strategy models (19 competitive
-+ 1 COLLAB) on live Alpaca paper trading data. Each model has $1,000 starting capital.
+of an evolutionary trading arena. The arena runs 12 competitive AI strategy models
+on live Alpaca paper trading data. Each model has $1,000 starting capital.
 
 Models self-improve between sessions by mutating their own parameters. Weekly evolution
 culls the bottom performers and breeds new ones from top performers.
+
+NOTE: The "realized_pnl" field on each model is the authoritative return figure,
+computed from filled sell orders. Use it over "return_pct" or capital-based calculations
+if they disagree.
 
 Review the following data for {data['session_date']} and produce a structured JSON analysis.
 
@@ -430,12 +470,31 @@ Produce ONLY a JSON object (no markdown, no explanation outside JSON) with this 
     {{"priority": "high/medium/low", "action": "what to do", "rationale": "why"}}
   ],
   "red_flags": ["critical issues that need immediate attention"],
-  "next_day_recommendations": "paragraph of recommendations for tomorrow"
+  "next_day_recommendations": "paragraph of recommendations for tomorrow",
+  "open_questions": [
+    {{"topic": "short name", "assessment": "your analysis/opinion on this topic"}}
+  ]
 }}
 
 Be specific, data-driven, and actionable. Reference actual model names, symbols, and numbers.
 If multi_day data is empty (first day), say so and focus on today only.
 For inactive models, diagnose likely causes (short sessions, high thresholds, strategy type mismatch).
+
+CRITICAL: Base your analysis ONLY on the data provided. If all models show 0% returns
+with non-zero trade counts, report this as a data collection issue — do NOT invent or
+extrapolate losses. Never fabricate specific dollar amounts not present in the data.
+
+IMPORTANT: Each model has stop_loss_pct and take_profit_pct fields. If these are null/None, the model
+has NO automatic exit discipline — it will hold positions until its strategy logic generates a sell
+signal or the session ends. Flag any models with null stop_loss_pct or take_profit_pct as a risk
+management concern and recommend they set values (e.g., 2% stop-loss, 3% take-profit) so that
+self-improvement can evolve the thresholds over time.
+
+OPEN QUESTIONS — include an "open_questions" array in your response with your assessment of each:
+1. "COLLAB model" — We are considering adding a collaborative model that is synthesized from the
+   top performers between sessions (not a real-time voting ensemble). It would inherit the best
+   parameters from winning strategies. Is this a good idea? What are the risks (overfitting,
+   reduced diversity, regime sensitivity)? How would you structure it?
 """
 
 
@@ -534,6 +593,19 @@ def _render_markdown(review: dict[str, Any]) -> str:
     if next_day:
         lines.append("## Next Day Recommendations")
         lines.append(next_day)
+        lines.append("")
+
+    # Open questions
+    open_qs = review.get("open_questions", [])
+    if open_qs:
+        lines.append("## Open Questions")
+        for q in open_qs:
+            if isinstance(q, dict):
+                lines.append(f"### {q.get('topic', '?')}")
+                lines.append(q.get("assessment", ""))
+                lines.append("")
+            else:
+                lines.append(f"- {q}")
         lines.append("")
 
     return "\n".join(lines)

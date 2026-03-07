@@ -32,7 +32,7 @@ def compute_fitness(
     trade_returns: list[float],
     trade_count: int,
     session_bars: int,
-    initial_capital: float = 1_000.0,
+    initial_capital: float = 2_000.0,
     weights: dict | None = None,
 ) -> FitnessScore:
     """Compute fitness with profit as the dominant objective.
@@ -49,10 +49,10 @@ def compute_fitness(
         FitnessScore with composite score and component breakdown.
     """
     w = {
-        "profit": 0.55,     # profit is king
+        "profit": 0.70,     # profit is king
         "sharpe": 0.15,     # risk-adjusted return as tiebreaker
         "drawdown": 0.15,   # don't blow up completely
-        "frequency": 0.15,  # actually trade, don't sit idle
+        "frequency": 0.00,  # disabled — judge models on returns, not activity
     }
     if weights:
         w.update(weights)

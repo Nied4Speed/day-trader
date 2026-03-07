@@ -224,6 +224,7 @@ class Arena:
                 params=model.parameters,
             )
             strategy.current_capital = model.current_capital
+            strategy.initial_capital = model.initial_capital
             self._models[model.id] = strategy
             self._model_records[model.id] = model
 
@@ -748,6 +749,7 @@ class Arena:
             if model:
                 self._model_records[model_id] = model
                 strategy.current_capital = model.current_capital
+                strategy.initial_capital = model.initial_capital
             positions = db.query(Position).filter(
                 Position.model_id == model_id, Position.quantity > 0
             ).all()
@@ -2294,6 +2296,7 @@ class Arena:
                 model.strategy_type, model.name, params=model.parameters,
             )
             strategy.current_capital = model.current_capital
+            strategy.initial_capital = model.initial_capital
             self._models[model.id] = strategy
             self._model_records[model.id] = model
 

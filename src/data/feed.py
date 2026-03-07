@@ -26,6 +26,89 @@ from src.core.strategy import BarData
 logger = logging.getLogger(__name__)
 
 
+class QuoteAggregator:
+    """Aggregates real-time quotes into synthetic OHLC bars.
+
+    Accepts quote ticks via on_quote() (synchronous, O(1) — safe for the event
+    loop) and periodically flushes accumulated mid-prices into BarData objects
+    with synthetic=True.  The callback receives a list[BarData] identical to
+    the bar-batch pipeline so it can be wired directly to _fan_out_bars.
+
+    Volume is always 0 on synthetic bars (quotes don't carry volume).
+    """
+
+    def __init__(self, interval_sec: float = 30.0):
+        self.interval_sec = interval_sec
+        self._ticks: dict[str, list[tuple[float, object]]] = {}  # symbol -> [(mid, ts)]
+        self._callback: Optional[Callable] = None
+        self._flush_handle: Optional[asyncio.TimerHandle] = None
+        self._running = False
+
+    def set_callback(self, callback: Callable) -> None:
+        """Register the bar-batch callback (same signature as _fan_out_bars)."""
+        self._callback = callback
+
+    def on_quote(self, symbol: str, bid: float, ask: float, timestamp) -> None:
+        """Accumulate a quote tick.  Pure list.append — no IO, no await."""
+        mid = (bid + ask) / 2.0
+        self._ticks.setdefault(symbol, []).append((mid, timestamp))
+
+    def start(self) -> None:
+        """Begin the periodic flush timer."""
+        self._running = True
+        self._schedule_flush()
+
+    def stop(self) -> None:
+        """Cancel the flush timer and drain remaining ticks."""
+        self._running = False
+        if self._flush_handle:
+            self._flush_handle.cancel()
+            self._flush_handle = None
+
+    def _schedule_flush(self) -> None:
+        if not self._running:
+            return
+        loop = asyncio.get_event_loop()
+        self._flush_handle = loop.call_later(
+            self.interval_sec,
+            lambda: asyncio.ensure_future(self._flush()),
+        )
+
+    async def _flush(self) -> None:
+        """Convert accumulated ticks into synthetic BarData and deliver."""
+        self._flush_handle = None
+        if not self._running:
+            return
+
+        bars: list[BarData] = []
+        for symbol, ticks in self._ticks.items():
+            if not ticks:
+                continue
+            prices = [t[0] for t in ticks]
+            bars.append(BarData(
+                symbol=symbol,
+                timestamp=ticks[-1][1],  # timestamp of last tick
+                open=prices[0],
+                high=max(prices),
+                low=min(prices),
+                close=prices[-1],
+                volume=0,
+                synthetic=True,
+            ))
+        self._ticks.clear()
+
+        if bars and self._callback:
+            try:
+                result = self._callback(bars)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                logger.exception("Error in QuoteAggregator flush callback")
+
+        # Re-schedule for next interval
+        self._schedule_flush()
+
+
 class AlpacaDataFeed:
     """Manages Alpaca WebSocket streaming and historical data fetching."""
 
@@ -38,6 +121,7 @@ class AlpacaDataFeed:
         self._bar_batch_callbacks: list[Callable] = []  # receive list[BarData]
         self._quote_callbacks: list[Callable] = []
         self._trade_update_callbacks: list[Callable] = []
+        self._subscribed_bars: set[str] = set()
         self._subscribed_quotes: set[str] = set()
         self._running = False
         self._last_bar_time: Optional[datetime] = None  # for heartbeat monitoring
@@ -398,6 +482,19 @@ class AlpacaDataFeed:
             except Exception:
                 logger.exception(f"Error in quote callback for {symbol}")
 
+    def subscribe_bars(self, symbols: list[str]) -> None:
+        """Subscribe to real-time bars for additional symbols mid-session.
+
+        Safe to call while streaming -- Alpaca SDK handles incremental subscriptions.
+        Skips symbols already subscribed.
+        """
+        new_symbols = [s for s in symbols if s not in self._subscribed_bars]
+        if not new_symbols:
+            return
+        self.stream.subscribe_bars(self._handle_bar, *new_symbols)
+        self._subscribed_bars.update(new_symbols)
+        logger.info(f"Subscribed to bars for {new_symbols} (total: {len(self._subscribed_bars)})")
+
     def subscribe_quotes(self, symbols: list[str]) -> None:
         """Subscribe to real-time quotes for the given symbols.
 
@@ -435,6 +532,7 @@ class AlpacaDataFeed:
             try:
                 if not subscribed:
                     self.stream.subscribe_bars(self._handle_bar, *symbols)
+                    self._subscribed_bars.update(symbols)
                     subscribed = True
                 logger.info(
                     f"Starting data stream for {len(symbols)} symbols"
@@ -580,6 +678,7 @@ class AlpacaDataFeed:
         """Stop all WebSocket streams by cancelling tasks and closing connections."""
         self._running = False
         self._connection_state = "disconnected"
+        self._subscribed_bars.clear()
         self._subscribed_quotes.clear()
 
         # Flush any pending bar batch before shutdown

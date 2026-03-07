@@ -35,6 +35,7 @@ class BarData:
     minutes_remaining: Optional[float] = None  # time left in session
     news_sentiment: Optional[float] = None  # -1.0 to +1.0, None if unavailable
     regime: Optional[Any] = None  # RegimeState, set by arena before fan-out
+    synthetic: bool = False  # True for bars aggregated from quote stream
 
 
 @dataclass
@@ -84,14 +85,15 @@ class Strategy(ABC):
 
     def __init__(self, name: str, params: Optional[dict] = None):
         self.name = name
-        self.current_capital: float = 1_000.0
+        self.current_capital: float = 2_000.0
+        self.initial_capital: float = 2_000.0
         self._bar_history: dict[str, list[BarData]] = {}
         self._positions: dict[str, float] = {}  # symbol -> quantity (set by arena)
         self._entry_prices: dict[str, float] = {}  # symbol -> avg entry price (set by arena)
-        # Risk management params — None means disabled. Strategies opt in by
-        # setting these in their own __init__/set_params.
-        self.stop_loss_pct: Optional[float] = None
-        self.take_profit_pct: Optional[float] = None
+        # Risk management defaults — 2% stop-loss, 3% take-profit.
+        # Strategies can override in their own __init__/set_params.
+        self.stop_loss_pct: Optional[float] = 2.0
+        self.take_profit_pct: Optional[float] = 3.0
         # LLM-generated watch rules (list of rule dicts)
         self._watch_rules: list[dict] = []
         # Cached indicator values per symbol, updated each on_bar()
@@ -287,7 +289,13 @@ class Strategy(ABC):
         return None
 
     def record_bar(self, bar: BarData) -> None:
-        """Store a bar in the history buffer for indicator computation."""
+        """Store a bar in the history buffer for indicator computation.
+
+        Synthetic bars (from quote aggregation) are skipped to prevent
+        mid-price OHLC from corrupting indicator series (MA, RSI, etc.).
+        """
+        if bar.synthetic:
+            return
         if bar.symbol not in self._bar_history:
             self._bar_history[bar.symbol] = []
         self._bar_history[bar.symbol].append(bar)

@@ -171,6 +171,27 @@ class TestPositionManagerStateCached:
         assert state._symbol_exposure.get("MSFT", 0) == 3 * 410.0
 
 
+class TestEndOfDayLiquidation:
+    def test_liquidate_closes_all_positions(self, arena_with_db):
+        arena, models, db_path = arena_with_db
+        arena._session_date = "2026-03-07"
+
+        # Verify positions exist before liquidation
+        db = get_session(db_path)
+        open_before = db.query(Position).filter(Position.quantity > 0).count()
+        db.close()
+        assert open_before == 3  # AAPL(5), MSFT(3), AAPL(2)
+
+        # Run EOD liquidation
+        arena._end_session_liquidate()
+
+        # All positions should now be zero
+        db = get_session(db_path)
+        open_after = db.query(Position).filter(Position.quantity > 0).count()
+        db.close()
+        assert open_after == 0
+
+
 class TestSelfImproveConfig:
     def test_enabled_by_default(self):
         config = Config.load()

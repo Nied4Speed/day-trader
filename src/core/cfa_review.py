@@ -385,10 +385,23 @@ def _build_review_prompt(data: dict[str, Any]) -> str:
     return f"""\
 You are a CFA charterholder and portfolio risk analyst reviewing the daily results
 of an evolutionary trading arena. The arena runs 12 competitive AI strategy models
-on live Alpaca paper trading data. Each model has $1,000 starting capital.
+on live Alpaca paper trading data. Each model has $2,000 starting capital.
 
-Models self-improve between sessions by mutating their own parameters. Weekly evolution
-culls the bottom performers and breeds new ones from top performers.
+## System Architecture
+
+- **Models**: 12 active across 8 strategy types: ma_crossover, rsi_reversion, momentum,
+  bollinger_bands, macd, vwap_reversion, breakout, mean_reversion.
+- **Capital**: $2,000 per model per day ($24,000 total portfolio). Capital resets daily.
+- **Fractional shares**: Enabled (min 0.01 shares or $1 notional). Market orders only for fractional.
+- **Risk defaults**: stop_loss_pct=2.0%, take_profit_pct=3.0% (evolvable via self-improvement).
+- **Position manager**: 15% max exposure per symbol, 80% max total exposure, correlation guards,
+  3% drawdown halves position sizes, 5% drawdown blocks new buys.
+- **Screener**: Discovers top 20 most-active symbols ($5 price floor), re-runs every 15 min.
+  Leveraged ETF blocklist (39 tickers like TQQQ, SQQQ, SOXL, UVIX, etc.) filtered out.
+- **Wind-down**: NO_BUY_WINDOW=10 bars before session end, LIQUIDATION_WINDOW=3 bars forces sells.
+- **Self-improvement**: Between sessions — losers 10% mutation, mediocre 5%, winners 2%.
+- **COLLAB model**: Disabled pending redesign as between-session synthesis from top performers.
+- **EOD liquidation**: All positions force-closed at session end + Alpaca hard safety net.
 
 NOTE: The "realized_pnl" field on each model is the authoritative return figure,
 computed from filled sell orders. Use it over "return_pct" or capital-based calculations

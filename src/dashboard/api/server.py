@@ -94,12 +94,10 @@ class ConnectionManager:
                         _arena_task is not None and not _arena_task.done()
                     )
                     if arena_running:
-                        # Arena is running — use cached model data + live status
+                        # Arena is running — use live in-memory model data + status
                         # (zero DB queries, never blocks)
                         status_data = get_arena_status()
-                        base = dict(_dashboard_cache) if _dashboard_cache else {
-                            "models": [], "trades": [], "generations": [], "sessions": [],
-                        }
+                        base = _get_live_dashboard()
                         base["arena_status"] = status_data["status"]
                         base["arena_log"] = status_data.get("log", [])
                         base["arena_run_state"] = get_arena_run_state()
@@ -168,9 +166,98 @@ _arena_instance: Arena | None = None
 _arena_config: dict | None = None  # {num_sessions, session_minutes}
 
 
+def _get_live_model_data() -> list[dict]:
+    """Build model data from the live arena instance's in-memory state.
+
+    Returns dashboard-compatible model dicts with current capital, positions,
+    and basic performance calculated from the strategy objects.
+    """
+    if _arena_instance is None:
+        return []
+
+    arena = _arena_instance
+    models_data = []
+    for model_id, strategy in arena._models.items():
+        record = arena._model_records.get(model_id)
+        if record is None:
+            continue
+
+        capital = strategy.current_capital
+        initial = record.initial_capital or 1000.0
+        total_pnl = capital - initial
+        return_pct = (total_pnl / initial) * 100 if initial > 0 else 0
+
+        # Build positions from strategy state + last known prices
+        positions = []
+        for symbol, qty in strategy._positions.items():
+            if qty == 0:
+                continue
+            entry = strategy._entry_prices.get(symbol, 0)
+            last_price = arena.execution._last_prices.get(symbol, entry)
+            unrealized = (last_price - entry) * qty if entry > 0 else 0
+            positions.append({
+                "symbol": symbol,
+                "quantity": qty,
+                "avg_entry": entry,
+                "current_price": last_price,
+                "unrealized_pnl": round(unrealized, 2),
+            })
+
+        # Count trades from tracker if available
+        total_trades = 0
+        win_rate = 0.0
+        if hasattr(arena, 'tracker') and model_id in getattr(arena.tracker, '_trade_counts', {}):
+            total_trades = arena.tracker._trade_counts[model_id]
+        if hasattr(arena, 'tracker') and model_id in getattr(arena.tracker, '_win_counts', {}):
+            wins = arena.tracker._win_counts[model_id]
+            win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+
+        equity = capital + sum(p["unrealized_pnl"] for p in positions)
+
+        models_data.append({
+            "id": model_id,
+            "name": record.name,
+            "strategy_type": record.strategy_type,
+            "generation": record.generation,
+            "parent_ids": record.parent_ids,
+            "genetic_operation": record.genetic_operation,
+            "initial_capital": initial,
+            "current_capital": round(capital, 2),
+            "performance": {
+                "equity": round(equity, 2),
+                "total_pnl": round(total_pnl, 2),
+                "return_pct": round(return_pct, 2),
+                "sharpe_ratio": 0,
+                "max_drawdown": 0,
+                "win_rate": round(win_rate, 1),
+                "total_trades": total_trades,
+                "session_number": arena._session_number,
+            },
+            "equity_curve": [],
+            "positions": positions,
+        })
+
+    models_data.sort(key=lambda m: m["performance"]["return_pct"], reverse=True)
+    for rank, m in enumerate(models_data, 1):
+        m["rank"] = rank
+
+    return models_data
+
+
+def _get_live_dashboard() -> dict:
+    """Build full dashboard data from live arena state."""
+    models = _get_live_model_data()
+    base = _dashboard_cache or {
+        "models": [], "trades": [], "generations": [], "sessions": [],
+    }
+    return {**base, "models": models}
+
+
 class ArenaStartRequest(BaseModel):
     num_sessions: int = Field(default=2, ge=1, le=20)
-    session_minutes: int = Field(default=60, ge=5, le=360)
+    session_minutes: int = Field(default=60, ge=5, le=390)
+    resume: bool = Field(default=False)
+    skip_cfa: bool = Field(default=False)
 
 
 def get_arena_run_state() -> dict:
@@ -437,9 +524,7 @@ async def dashboard(session_date: Optional[str] = None):
     arena_running = _arena_task is not None and not _arena_task.done()
     if arena_running and session_date is None:
         status = get_arena_status()
-        base = _dashboard_cache or {
-            "models": [], "trades": [], "generations": [], "sessions": [],
-        }
+        base = _get_live_dashboard()
         base["arena_status"] = status["status"]
         base["arena_log"] = status.get("log", [])
         base["arena_run_state"] = get_arena_run_state()
@@ -812,10 +897,14 @@ async def arena_start(req: ArenaStartRequest):
             "session_minutes": req.session_minutes,
         }
         _arena_task = asyncio.create_task(
-            _arena_instance.run_custom(req.num_sessions, req.session_minutes)
+            _arena_instance.run_custom(
+                req.num_sessions, req.session_minutes,
+                resume=req.resume, skip_cfa=req.skip_cfa,
+            )
         )
         logger.info(
             f"Arena started: {req.num_sessions} sessions x {req.session_minutes} min"
+            + (" (RESUME)" if req.resume else "")
         )
         return {
             "status": "started",

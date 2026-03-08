@@ -726,8 +726,9 @@ on live Alpaca paper trading data. Each model has $2,000 starting capital.
 
 ## System Architecture
 
-- **Models**: 12 active across 8 strategy types: ma_crossover, rsi_reversion, momentum,
-  bollinger_bands, macd, vwap_reversion, breakout, mean_reversion.
+- **Models**: 13 active — 12 base models across 8 strategy types (ma_crossover, rsi_reversion,
+  momentum, bollinger_bands, macd, vwap_reversion, breakout, mean_reversion) plus your
+  cfa_generated model.
 - **Capital**: $2,000 per model per day ($24,000 total portfolio). Capital resets daily.
 - **Fractional shares**: Enabled (min 0.01 shares or $1 notional). Market orders only for fractional.
 - **Risk defaults**: stop_loss_pct=2.0%, take_profit_pct=3.0% (evolvable via self-improvement).
@@ -762,9 +763,10 @@ running.
 - **Your generated strategy counts as one of the 12 slots.** If you want to test a radically
   different approach, you can — just build it in your generated_strategy output.
 
-The constraint: we want to keep exactly 12 models total. So any additions require removing
-an equal number. Think of it as portfolio construction — which 12 strategies give us the best
-risk-adjusted returns?
+The constraint: we want to keep exactly 13 models total (12 base + your cfa_generated model).
+So any additions require removing an equal number. Think of it as portfolio construction — which
+13 strategies give us the best risk-adjusted returns? You always keep your own slot, but you can
+recommend replacing any of the other 12.
 
 Include roster recommendations in your action_items if you think changes are warranted.
 

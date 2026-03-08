@@ -85,7 +85,7 @@ class BollingerBandsStrategy(Strategy):
         elif realized_pnl > 0:
             self.num_std -= 0.05
         self.num_std = max(1.0, min(3.5, self.num_std))
-        logger.debug(
+        logger.info(
             f"{self.name} adapt: num_std {old_std:.2f}->{self.num_std:.2f}, "
             f"pnl={realized_pnl:.2f}"
         )

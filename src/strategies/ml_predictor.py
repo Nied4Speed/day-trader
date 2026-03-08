@@ -166,7 +166,7 @@ class MLPredictorStrategy(Strategy):
             self.buy_threshold -= 0.0002
         self.buy_threshold = max(0.0001, min(0.01, self.buy_threshold))
         self.sell_threshold = max(-0.005, min(-0.0001, self.sell_threshold))
-        logger.debug(
+        logger.info(
             f"{self.name} adapt: pnl={realized_pnl:.2f} "
             f"buy_thresh {old_buy:.4f}->{self.buy_threshold:.4f} "
             f"sell_thresh {old_sell:.4f}->{self.sell_threshold:.4f}"

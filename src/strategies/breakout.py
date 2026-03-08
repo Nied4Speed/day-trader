@@ -96,7 +96,7 @@ class BreakoutStrategy(Strategy):
         elif false_breakout_rate < 0.3:
             self.breakout_pct -= 0.001
         self.breakout_pct = max(0.0005, min(0.02, self.breakout_pct))
-        logger.debug(
+        logger.info(
             f"{self.name} adapt: breakout_pct {old_pct:.4f}->{self.breakout_pct:.4f}, "
             f"false_breakout_rate={false_breakout_rate:.2f}, pnl={realized_pnl:.2f}"
         )

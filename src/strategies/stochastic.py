@@ -104,7 +104,7 @@ class StochasticStrategy(Strategy):
             self.overbought -= 1.0
         self.oversold = max(10.0, min(35.0, self.oversold))
         self.overbought = max(65.0, min(90.0, self.overbought))
-        logger.debug(
+        logger.info(
             f"{self.name} adapt: pnl={realized_pnl:.2f} "
             f"oversold {old_os:.1f}->{self.oversold:.1f} "
             f"overbought {old_ob:.1f}->{self.overbought:.1f}"

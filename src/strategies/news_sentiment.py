@@ -90,7 +90,7 @@ class NewsSentimentStrategy(Strategy):
             self.bullish_threshold -= 0.02
         self.bullish_threshold = max(0.1, min(0.8, self.bullish_threshold))
         self.bearish_threshold = max(-0.8, min(-0.1, self.bearish_threshold))
-        logger.debug(
+        logger.info(
             f"{self.name} adapt: pnl={realized_pnl:.2f} "
             f"bull {old_bull:.2f}->{self.bullish_threshold:.2f} "
             f"bear {old_bear:.2f}->{self.bearish_threshold:.2f}"

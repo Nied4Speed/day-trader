@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.daytrader.backend</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/brandonnied/day-trader/.venv/bin/uvicorn</string>
+        <string>src.dashboard.api.server:app</string>
+        <string>--port</string>
+        <string>8000</string>
+        <string>--host</string>
+        <string>0.0.0.0</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/brandonnied/day-trader</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/brandonnied/day-trader/.venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/brandonnied/day-trader/logs/backend-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/brandonnied/day-trader/logs/backend-stderr.log</string>
+</dict>
+</plist>

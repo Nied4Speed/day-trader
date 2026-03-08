@@ -89,7 +89,7 @@ class MomentumStrategy(Strategy):
         elif realized_pnl > 0:
             self.buy_threshold -= 0.002
         self.buy_threshold = max(0.005, min(0.10, self.buy_threshold))
-        logger.debug(
+        logger.info(
             f"{self.name} adapt: buy_threshold {old_thresh:.4f}->{self.buy_threshold:.4f}, "
             f"pnl={realized_pnl:.2f}"
         )

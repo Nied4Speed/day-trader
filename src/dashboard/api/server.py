@@ -203,14 +203,14 @@ def _get_live_model_data() -> list[dict]:
                 "unrealized_pnl": round(unrealized, 2),
             })
 
-        # Count trades from tracker if available
+        # Count trades from tracker metrics
         total_trades = 0
         win_rate = 0.0
-        if hasattr(arena, 'tracker') and model_id in getattr(arena.tracker, '_trade_counts', {}):
-            total_trades = arena.tracker._trade_counts[model_id]
-        if hasattr(arena, 'tracker') and model_id in getattr(arena.tracker, '_win_counts', {}):
-            wins = arena.tracker._win_counts[model_id]
-            win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+        if hasattr(arena, 'tracker'):
+            metrics = arena.tracker._metrics.get(model_id)
+            if metrics:
+                total_trades = metrics.total_trades
+                win_rate = metrics.win_rate
 
         equity = capital + sum(p["unrealized_pnl"] for p in positions)
 
@@ -1001,3 +1001,27 @@ async def websocket_endpoint(websocket: WebSocket):
             data = await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
+
+
+# --- Static frontend serving ---
+# Serve the Vite production build so no separate dev server is needed.
+# Must be mounted AFTER all API/WS routes to avoid shadowing them.
+_frontend_dist = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "frontend", "dist",
+)
+if os.path.isdir(_frontend_dist):
+    from fastapi.staticfiles import StaticFiles
+    from fastapi.responses import FileResponse
+
+    # Serve static assets (JS, CSS, etc.)
+    app.mount("/assets", StaticFiles(directory=os.path.join(_frontend_dist, "assets")), name="static-assets")
+
+    # Catch-all for SPA routing — serve index.html for any non-API path
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        # If a specific file exists in dist, serve it (favicon, etc.)
+        file_path = os.path.join(_frontend_dist, full_path)
+        if full_path and os.path.isfile(file_path):
+            return FileResponse(file_path)
+        return FileResponse(os.path.join(_frontend_dist, "index.html"))

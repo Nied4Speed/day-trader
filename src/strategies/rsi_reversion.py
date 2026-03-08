@@ -96,7 +96,7 @@ class RSIReversionStrategy(Strategy):
             self.overbought -= 1
         self.oversold = max(15.0, min(40.0, self.oversold))
         self.overbought = max(60.0, min(85.0, self.overbought))
-        logger.debug(
+        logger.info(
             f"{self.name} adapt: oversold {old_oversold}->{self.oversold}, "
             f"overbought {old_overbought}->{self.overbought}, pnl={realized_pnl:.2f}"
         )

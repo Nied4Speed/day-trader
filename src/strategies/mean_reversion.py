@@ -79,7 +79,7 @@ class MeanReversionStrategy(Strategy):
             self.sell_deviation -= 0.0015
         self.buy_deviation = max(-0.05, min(-0.005, self.buy_deviation))
         self.sell_deviation = max(0.005, min(0.05, self.sell_deviation))
-        logger.debug(
+        logger.info(
             f"{self.name} adapt: pnl={realized_pnl:.2f} "
             f"buy_dev {old_buy:.4f}->{self.buy_deviation:.4f} "
             f"sell_dev {old_sell:.4f}->{self.sell_deviation:.4f}"

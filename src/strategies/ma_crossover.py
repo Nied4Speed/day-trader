@@ -97,7 +97,7 @@ class MACrossoverStrategy(Strategy):
         # Ensure slow always > fast
         if self.slow_period <= self.fast_period:
             self.slow_period = self.fast_period + 1
-        logger.debug(
+        logger.info(
             f"{self.name} adapt: fast_period {old_fast}->{self.fast_period}, "
             f"slow_period {old_slow}->{self.slow_period}, pnl={realized_pnl:.2f}"
         )

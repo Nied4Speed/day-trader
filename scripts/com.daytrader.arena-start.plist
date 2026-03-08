@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.daytrader.arena-start</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/curl</string>
+        <string>-s</string>
+        <string>-X</string>
+        <string>POST</string>
+        <string>-H</string>
+        <string>Content-Type: application/json</string>
+        <string>-d</string>
+        <string>{"num_sessions": 1, "session_minutes": 390}</string>
+        <string>http://localhost:8000/api/arena/start</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/brandonnied/day-trader</string>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <!-- Monday through Friday at 6:00 AM PT = 9:00 AM ET -->
+        <dict>
+            <key>Weekday</key><integer>1</integer>
+            <key>Hour</key><integer>6</integer>
+            <key>Minute</key><integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>2</integer>
+            <key>Hour</key><integer>6</integer>
+            <key>Minute</key><integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>3</integer>
+            <key>Hour</key><integer>6</integer>
+            <key>Minute</key><integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>4</integer>
+            <key>Hour</key><integer>6</integer>
+            <key>Minute</key><integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>5</integer>
+            <key>Hour</key><integer>6</integer>
+            <key>Minute</key><integer>0</integer>
+        </dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/brandonnied/day-trader/logs/arena-cron-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/brandonnied/day-trader/logs/arena-cron-stderr.log</string>
+</dict>
+</plist>

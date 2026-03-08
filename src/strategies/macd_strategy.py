@@ -100,7 +100,7 @@ class MACDStrategy(Strategy):
         elif realized_pnl > 0:
             self.histogram_threshold -= 0.02
         self.histogram_threshold = max(0.0, min(1.0, self.histogram_threshold))
-        logger.debug(
+        logger.info(
             f"{self.name} adapt: histogram_threshold {old_thresh:.2f}->{self.histogram_threshold:.2f}, "
             f"pnl={realized_pnl:.2f}"
         )

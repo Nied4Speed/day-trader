@@ -82,7 +82,7 @@ class VWAPReversionStrategy(Strategy):
             self.deviation_sell -= 0.0005
         self.deviation_buy = max(-0.02, min(-0.001, self.deviation_buy))
         self.deviation_sell = max(0.001, min(0.02, self.deviation_sell))
-        logger.debug(
+        logger.info(
             f"{self.name} adapt: pnl={realized_pnl:.2f} "
             f"dev_buy {old_buy:.4f}->{self.deviation_buy:.4f} "
             f"dev_sell {old_sell:.4f}->{self.deviation_sell:.4f}"

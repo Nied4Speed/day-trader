@@ -744,6 +744,30 @@ NOTE: The "realized_pnl" field on each model is the authoritative return figure,
 computed from filled sell orders. Use it over "return_pct" or capital-based calculations
 if they disagree.
 
+## Strategy Roster — You Have Full Control
+
+The current 12 models use 8 common day-trading strategy types that were picked as a starting
+point: ma_crossover, rsi_reversion, momentum, bollinger_bands, macd, vwap_reversion, breakout,
+mean_reversion. These are NOT sacred — they were chosen as generic baselines to get the arena
+running.
+
+**You can and should recommend changes to the roster.** Specifically:
+- **Eliminate underperformers**: If a strategy type is consistently losing, recommend we remove
+  it and replace it with something better. Name the specific model(s) to cut.
+- **Add new strategy types**: If you think a different approach would work better (pairs trading,
+  statistical arbitrage, volume profile, order flow, gamma scalping, etc.), recommend it. We will
+  implement it.
+- **Rebalance the mix**: If one strategy type dominates, recommend adding more variants of it
+  or reducing over-represented losers.
+- **Your generated strategy counts as one of the 12 slots.** If you want to test a radically
+  different approach, you can — just build it in your generated_strategy output.
+
+The constraint: we want to keep exactly 12 models total. So any additions require removing
+an equal number. Think of it as portfolio construction — which 12 strategies give us the best
+risk-adjusted returns?
+
+Include roster recommendations in your action_items if you think changes are warranted.
+
 Review the following data for {data['session_date']} and produce a structured JSON analysis.
 
 ## Today's Data

@@ -19,7 +19,7 @@ from datetime import datetime, time, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from src.core.cfa_review import apply_cfa_strategy, run_cfa_review
+from src.core.cfa_review import apply_cfa_strategy, extract_parameter_recommendations, run_cfa_review
 from src.core.config import Config
 from src.core.database import (
     DailyLedger,
@@ -659,7 +659,9 @@ class Arena:
                 symbol=order.symbol, side=order.side, quantity=order.quantity
             )
             self.position_manager.lock_symbol(order.symbol)
-            # Pre-deduct capital before submission so subsequent risk checks see reduced balance
+            # Pre-deduct capital so subsequent orders in this batch see reduced
+            # balance for risk checks. _refresh_model_state() after gather
+            # overwrites in-memory capital from DB, so this is transient.
             if signal.side == "buy":
                 est_price = self.execution._last_prices.get(order.symbol, 100)
                 self._models[primary_model].current_capital -= signal.quantity * est_price
@@ -1185,12 +1187,25 @@ class Arena:
                     self._refresh_model_state, model_id, self._models[model_id]
                 )
 
-    def _end_session_liquidate(self) -> None:
-        """Force-close any remaining positions at session end."""
+    def _end_session_liquidate_sync(self) -> None:
+        """Force-close remaining positions (sync version for backtest/offline)."""
         logger.info("EOD liquidation: closing remaining positions")
         closed = self.execution.liquidate_all(self._session_date)
-        # Hard safety net: close anything on Alpaca that our DB missed
         alpaca_closed = self.execution.liquidate_all_alpaca()
+        if alpaca_closed:
+            logger.info(f"Alpaca hard liquidation closed {alpaca_closed} extra positions")
+        if closed or alpaca_closed:
+            self.tracker.update_all()
+
+    async def _end_session_liquidate(self) -> None:
+        """Force-close remaining positions without blocking the event loop."""
+        logger.info("EOD liquidation: closing remaining positions")
+        closed = await asyncio.to_thread(
+            self.execution.liquidate_all, self._session_date
+        )
+        alpaca_closed = await asyncio.to_thread(
+            self.execution.liquidate_all_alpaca
+        )
         if alpaca_closed:
             logger.info(f"Alpaca hard liquidation closed {alpaca_closed} extra positions")
         if closed or alpaca_closed:
@@ -1598,6 +1613,59 @@ class Arena:
         except Exception:
             logger.exception("CFA Review failed (non-fatal)")
 
+    async def _run_cfa_review_with_recommendations(self) -> dict[str, dict]:
+        """Run CFA review and extract parameter recommendations.
+
+        Wraps _run_cfa_review() logic but returns the extracted recommendations
+        dict for use by _self_improve(). Also handles strategy generation (existing
+        behavior). Returns {} on failure (graceful fallback to random mutations).
+        """
+        if not self.config.arena.cfa_review_enabled:
+            logger.info("CFA review disabled, skipping (no recommendations)")
+            return {}
+
+        self._set_status("reviewing", "Running CFA review")
+        try:
+            incident_notes = "\n".join(f"- {n}" for n in self._incident_notes) if self._incident_notes else ""
+            review = await asyncio.to_thread(
+                run_cfa_review,
+                self.config.db_path,
+                self._session_date,
+                self.config.arena.cfa_review_model,
+                self.config.arena.cfa_review_timeout_sec,
+                self.config.arena.cfa_review_lookback_days,
+                incident_notes,
+            )
+            if not review:
+                logger.warning("CFA Review returned no result — no recommendations")
+                return {}
+
+            self._print_cfa_review(review)
+
+            # Apply CFA-generated strategy if present
+            strategy_code = review.get("generated_strategy")
+            if strategy_code:
+                self._set_status("reviewing", "Applying CFA-generated strategy")
+                success = await asyncio.to_thread(
+                    apply_cfa_strategy,
+                    strategy_code,
+                    self.config.db_path,
+                    self.config.arena.initial_capital,
+                )
+                if success:
+                    logger.info("CFA-generated strategy applied — will be active next session")
+                else:
+                    logger.warning("CFA-generated strategy failed validation — skipped")
+
+            # Extract parameter recommendations
+            valid_names = {m.model_name for m in self.tracker.get_leaderboard()}
+            recs = extract_parameter_recommendations(review, valid_model_names=valid_names)
+            return recs
+
+        except Exception:
+            logger.exception("CFA Review failed (non-fatal) — no recommendations")
+            return {}
+
     def _print_cfa_review(self, review: dict) -> None:
         """Print CFA review highlights to the console."""
         grade = review.get("portfolio_grade", "?")
@@ -1679,13 +1747,20 @@ class Arena:
         finally:
             db.close()
 
-    def _self_improve(self) -> None:
+    def _self_improve(self, cfa_recommendations: dict[str, dict] | None = None) -> None:
         """Between-session self-improvement.
 
         Each strategy tweaks its parameters based on session performance.
-        Uses mutation memory to bias toward historically successful directions.
+        CFA recommendations are applied first (if available), then random
+        mutations fill in params CFA didn't address.
+
+        Args:
+            cfa_recommendations: Optional dict from extract_parameter_recommendations().
+                Maps model_name -> {param: {"value": num, "confidence": str, "rationale": str}}.
         """
         logger.info("=== BREAK: Self-improvement phase ===")
+        if cfa_recommendations:
+            logger.info(f"CFA recommendations available for {len(cfa_recommendations)} models")
         leaderboard = self.tracker.get_leaderboard()
         use_memory = self.config.arena.mutation_memory_enabled
         dampening = self.config.arena.mutation_bias_dampening
@@ -1709,6 +1784,12 @@ class Arena:
                 params = strategy.get_params()
                 new_params = copy.deepcopy(params)
 
+                # Inject base class risk params so CFA can tune them
+                if "stop_loss_pct" not in new_params:
+                    new_params["stop_loss_pct"] = getattr(strategy, "stop_loss_pct", 2.0)
+                if "take_profit_pct" not in new_params:
+                    new_params["take_profit_pct"] = getattr(strategy, "take_profit_pct", 3.0)
+
                 # Strategies that lost money get stronger mutations
                 if metrics.return_pct < 0:
                     mutation_strength = 0.10
@@ -1723,8 +1804,48 @@ class Arena:
                 biases = MutationMemory.get_biases(memory) if memory else {}
                 mutations_applied: dict[str, str] = {}
 
+                # Get CFA recs for this model (by name)
+                model_cfa_recs = (cfa_recommendations or {}).get(metrics.model_name, {})
+                cfa_applied_count = 0
+
                 for key, value in new_params.items():
-                    if isinstance(value, (int, float)) and random.random() < 0.4:
+                    if not isinstance(value, (int, float)):
+                        continue
+
+                    cfa_rec = model_cfa_recs.get(key)
+                    if cfa_rec:
+                        target = cfa_rec["value"]
+                        confidence = cfa_rec["confidence"]
+
+                        if confidence == "high":
+                            # Direct override
+                            new_value = target
+                            mutations_applied[key] = "cfa_high"
+                        elif confidence == "medium":
+                            # Blend 70% toward target
+                            new_value = value + 0.7 * (target - value)
+                            mutations_applied[key] = "cfa_medium"
+                        else:  # low
+                            # Bias random mutation toward CFA's target
+                            direction_bias = 1.0 if target > value else -1.0
+                            perturbation = abs(MutationMemory.apply_bias(
+                                mutation_strength, 0.0, dampening
+                            )) * direction_bias
+                            new_value = value * (1 + perturbation)
+                            mutations_applied[key] = "cfa_low"
+
+                        if isinstance(value, int):
+                            new_value = max(1, int(round(new_value)))
+                        else:
+                            new_value = round(new_value, 6)
+                        new_params[key] = new_value
+                        cfa_applied_count += 1
+                        logger.info(
+                            f"  CFA-guided [{confidence}] {metrics.model_name}.{key}: "
+                            f"{value} -> {new_value} (target={target}, rationale={cfa_rec.get('rationale', '')[:80]})"
+                        )
+                    elif random.random() < 0.4:
+                        # No CFA rec: existing random mutation
                         bias = biases.get(key, 0.0)
                         perturbation = MutationMemory.apply_bias(
                             mutation_strength, bias, dampening
@@ -1743,6 +1864,12 @@ class Arena:
                             mutations_applied[key] = "down"
 
                 strategy.set_params(new_params)
+
+                # Apply stop_loss_pct / take_profit_pct back to base class with clamping
+                if "stop_loss_pct" in new_params:
+                    strategy.stop_loss_pct = max(0.5, min(10.0, float(new_params["stop_loss_pct"])))
+                if "take_profit_pct" in new_params:
+                    strategy.take_profit_pct = max(0.5, min(15.0, float(new_params["take_profit_pct"])))
 
                 # Generate LLM watch rules (skip COLLAB)
                 if (
@@ -1806,11 +1933,12 @@ class Arena:
 
                 biased_count = sum(1 for b in biases.values() if b != 0.0)
                 rules_count = len(strategy._watch_rules)
+                cfa_tag = f", cfa={cfa_applied_count}" if cfa_applied_count else ""
                 logger.info(
                     f"  {metrics.model_name}: return={metrics.return_pct:+.2f}%, "
                     f"mutation={mutation_strength*100:.0f}%, "
                     f"biased={biased_count}/{len(biases)} params, "
-                    f"watch_rules={rules_count}"
+                    f"watch_rules={rules_count}{cfa_tag}"
                 )
 
             db.commit()
@@ -1821,7 +1949,7 @@ class Arena:
         for strategy in self._models.values():
             strategy.reset()
 
-        logger.info("=== Self-improvement complete. Starting Session 2. ===")
+        logger.info("=== Self-improvement complete. ===")
 
     async def _run_session(self, session_number: int) -> dict:
         """Run a single trading session.
@@ -1951,20 +2079,29 @@ class Arena:
             if self._quote_aggregator:
                 self._quote_aggregator.stop()
                 self._quote_aggregator = None
+            # Let timer_task finish naturally (it called stop_streaming) to avoid
+            # cancelling SDK close mid-flight, which leaves streams half-closed and
+            # causes the second stop_streaming call below to hang (freeze bug #3).
             for task in (timer_task, screener_task):
                 if not task.done():
-                    task.cancel()
                     try:
-                        await task
+                        await asyncio.wait_for(asyncio.shield(task), timeout=10.0)
+                    except asyncio.TimeoutError:
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
                     except asyncio.CancelledError:
                         pass
-            # Ensure streams are stopped even on unexpected exit
+            # Ensure streams are stopped even on unexpected exit (no-op if timer
+            # already stopped them, since stop_streaming clears refs before closing)
             await self.feed.stop_streaming()
         self._quote_subscribed.clear()
         self._clear_watches()
 
         # EOD liquidation: force-close remaining positions
-        self._end_session_liquidate()
+        await self._end_session_liquidate()
 
         # Final performance update
         self.tracker.update_all()
@@ -2010,13 +2147,12 @@ class Arena:
             for m in models:
                 m.current_capital = self.config.arena.initial_capital
                 m.initial_capital = self.config.arena.initial_capital
-            db.query(Position).update({
-                Position.quantity: 0,
-                Position.avg_entry_price: 0.0,
-                Position.current_price: 0.0,
-                Position.unrealized_pnl: 0.0,
-                Position.realized_pnl: 0.0,
-            })
+            # DELETE all position rows (not just zero qty) to prevent stale
+            # rows from being overwritten with Alpaca's account-wide qty during
+            # reconciliation, which causes phantom position duplication.
+            deleted_count = db.query(Position).delete()
+            if deleted_count:
+                logger.info(f"Deleted {deleted_count} position rows (fresh start)")
             # Resolve stale PENDING orders from prior sessions
             stale = db.query(Order).filter(Order.status == OrderStatus.PENDING).update(
                 {Order.status: OrderStatus.REJECTED, Order.rejected_reason: "stale (reset)"}
@@ -2123,18 +2259,6 @@ class Arena:
             self._set_status("reflecting", "Generating S2 reflections")
             self._generate_session_summaries(2)
 
-            # === POST-S2: Evaluate + Self-improvement ===
-            if self.config.arena.self_improve_enabled:
-                self._set_status("improving", "Post-S2 self-improvement")
-                self._evaluate_pending_mutations()
-                param_snapshots_2 = {
-                    mid: {**strategy.get_params(), "_watch_rules": list(strategy._watch_rules)}
-                    for mid, strategy in self._models.items()
-                }
-                session_start_params_2 = dict(self._session_start_params)
-                self._self_improve()
-                self._generate_improvement_summaries(param_snapshots_2, session_number=2, session_start_params=session_start_params_2)
-
             # === DAY TOTAL ===
             self._set_status("complete", "Day complete")
             day_summary = self._compute_day_total(summary_1, summary_2)
@@ -2143,8 +2267,19 @@ class Arena:
             # Save daily ledger
             self._save_daily_ledger()
 
-            # CFA review
-            await self._run_cfa_review()
+            # CFA review first, then CFA-guided self-improvement
+            cfa_recs = await self._run_cfa_review_with_recommendations()
+
+            if self.config.arena.self_improve_enabled:
+                self._set_status("improving", "CFA-guided post-S2 self-improvement")
+                self._evaluate_pending_mutations()
+                param_snapshots_2 = {
+                    mid: {**strategy.get_params(), "_watch_rules": list(strategy._watch_rules)}
+                    for mid, strategy in self._models.items()
+                }
+                session_start_params_2 = dict(self._session_start_params)
+                self._self_improve(cfa_recommendations=cfa_recs)
+                self._generate_improvement_summaries(param_snapshots_2, session_number=2, session_start_params=session_start_params_2)
 
         except KeyboardInterrupt:
             logger.info("Arena interrupted by user")
@@ -2167,6 +2302,7 @@ class Arena:
                     model state from DB so models continue with existing positions.
             skip_cfa: If True, skip the post-session CFA review.
         """
+        self._skip_cfa = skip_cfa
         logger.info(
             f"Arena starting custom run: {num_sessions} sessions x "
             f"{session_minutes} min each"
@@ -2243,7 +2379,10 @@ class Arena:
                 self._generate_session_summaries(session_number)
                 self._save_daily_ledger()  # Save BEFORE self-improvement can crash
 
-                if self.config.arena.self_improve_enabled:
+                is_last_session = session_number == num_sessions
+
+                # Self-improve between sessions (skip last — CFA-guided improve runs after loop)
+                if self.config.arena.self_improve_enabled and not is_last_session:
                     self._set_status(
                         "improving",
                         f"Self-improvement after S{session_number}",
@@ -2262,11 +2401,11 @@ class Arena:
                         param_snapshots, session_number=session_number,
                         session_start_params=session_start_params,
                     )
-                else:
+                elif not self.config.arena.self_improve_enabled:
                     logger.info(f"Self-improvement disabled after S{session_number}")
 
                 # Brief break between sessions (skip after last)
-                if session_number < num_sessions:
+                if not is_last_session:
                     break_seconds = self.config.arena.break_minutes * 60
                     self._set_status(
                         "break",
@@ -2284,20 +2423,38 @@ class Arena:
 
             self._save_daily_ledger()
 
-            # CFA review
-            if skip_cfa:
+            # CFA review first, then CFA-guided self-improvement
+            cfa_recs: dict[str, dict] = {}
+            if self._skip_cfa:
                 logger.info("CFA review skipped (skip_cfa=True)")
             else:
-                await self._run_cfa_review()
+                cfa_recs = await self._run_cfa_review_with_recommendations()
+
+            if self.config.arena.self_improve_enabled:
+                self._set_status("improving", "CFA-guided self-improvement (post-day)")
+                self._evaluate_pending_mutations()
+                param_snapshots = {
+                    mid: {
+                        **strategy.get_params(),
+                        "_watch_rules": list(strategy._watch_rules),
+                    }
+                    for mid, strategy in self._models.items()
+                }
+                session_start_params = dict(self._session_start_params)
+                self._self_improve(cfa_recommendations=cfa_recs)
+                self._generate_improvement_summaries(
+                    param_snapshots, session_number=num_sessions,
+                    session_start_params=session_start_params,
+                )
 
         except asyncio.CancelledError:
             logger.info("Arena custom run cancelled — liquidating positions")
-            self._end_session_liquidate()
+            await self._end_session_liquidate()
             self._set_status("complete", "Run cancelled")
             raise
         except KeyboardInterrupt:
             logger.info("Arena interrupted — liquidating positions")
-            self._end_session_liquidate()
+            await self._end_session_liquidate()
         finally:
             self.config.arena.session_1_minutes = original_s1
             self.config.arena.session_2_minutes = original_s2
@@ -2498,7 +2655,7 @@ class Arena:
         self._clear_watches()
 
         # Liquidate and summarize
-        self._end_session_liquidate()
+        await self._end_session_liquidate()
         self.tracker.update_all()
 
         summary = self.tracker.generate_session_summary()
@@ -3106,8 +3263,8 @@ class Arena:
 
         loop.close()
 
-        # Force-close anything still open
-        self._end_session_liquidate()
+        # Force-close anything still open (sync — backtest has no running event loop)
+        self._end_session_liquidate_sync()
 
         # Final update
         self.tracker.set_last_prices(dict(self.execution._last_prices))

@@ -698,18 +698,25 @@ class AlpacaDataFeed:
             await asyncio.gather(*self._tasks, return_exceptions=True)
             self._tasks.clear()
 
-        if self._stream:
+        # Close SDK streams with timeout to prevent hanging on degraded connections.
+        # Grab references and clear immediately so a concurrent/second call is a no-op.
+        stream, self._stream = self._stream, None
+        trading_stream, self._trading_stream = self._trading_stream, None
+
+        if stream:
             try:
-                await self._stream.close()
+                await asyncio.wait_for(stream.close(), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning("Data stream close timed out (5s), force-abandoning")
             except Exception:
                 logger.exception("Error closing data stream")
-            self._stream = None
 
-        if self._trading_stream:
+        if trading_stream:
             try:
-                await self._trading_stream.close()
+                await asyncio.wait_for(trading_stream.close(), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning("Trading stream close timed out (5s), force-abandoning")
             except Exception:
                 logger.exception("Error closing trading stream")
-            self._trading_stream = None
 
         logger.info("All streams stopped")

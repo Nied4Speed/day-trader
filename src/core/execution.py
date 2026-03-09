@@ -149,7 +149,34 @@ class ExecutionHandler:
                     if db_order:
                         db_order.status = OrderStatus.REJECTED
                         db_order.rejected_reason = f"Alpaca {event}"
-                        db.commit()
+
+                    # If a SELL was rejected, the DB position is phantom —
+                    # we thought we held it but Alpaca disagrees. Zero it out
+                    # and credit back the cost basis.
+                    if pending["signal"].side == "sell":
+                        position = (
+                            db.query(Position)
+                            .filter(
+                                Position.model_id == pending["model_id"],
+                                Position.symbol == pending["signal"].symbol,
+                            )
+                            .first()
+                        )
+                        if position and position.quantity > 0:
+                            model = db.query(TradingModel).get(pending["model_id"])
+                            if model:
+                                cost_basis = position.avg_entry_price * position.quantity
+                                model.current_capital += cost_basis
+                                logger.info(
+                                    f"Sell {event}: credited ${cost_basis:.2f} back to "
+                                    f"model {pending['model_id']} for phantom "
+                                    f"{pending['signal'].symbol}"
+                                )
+                            position.quantity = 0
+                            position.avg_entry_price = 0.0
+                            position.unrealized_pnl = 0.0
+
+                    db.commit()
                 except Exception:
                     db.rollback()
                     logger.exception(f"Error processing TradingStream {event} for {alpaca_id}")
@@ -367,6 +394,20 @@ class ExecutionHandler:
                             f"Skipping sell for model {model_id} {signal.symbol}: no position held"
                         )
                         return None
+                    # Clamp sell quantity to actual position to prevent selling
+                    # shares that belong to other models in the shared Alpaca account.
+                    if signal.quantity > pos.quantity:
+                        logger.info(
+                            f"Clamping sell qty for model {model_id} {signal.symbol}: "
+                            f"{signal.quantity:.4f} -> {pos.quantity:.4f}"
+                        )
+                        signal = TradeSignal(
+                            symbol=signal.symbol, side="sell",
+                            quantity=pos.quantity,
+                            order_type=signal.order_type,
+                            limit_price=signal.limit_price,
+                        )
+                        fill_qty = signal.quantity
 
                 # Live mode: submit to Alpaca, let TradingStream handle fill
                 alpaca_side = (
@@ -679,10 +720,15 @@ class ExecutionHandler:
     def reconcile_positions_with_alpaca(self) -> dict:
         """Sync DB positions with actual Alpaca positions.
 
-        Queries Alpaca for real positions, then:
-        - Zeros out DB positions that don't exist on Alpaca (phantom positions)
-        - Updates quantity for mismatches
-        - Adjusts model capital for cleaned-up phantom positions
+        Compares SYMBOL TOTALS (sum across all models) vs Alpaca account-wide
+        positions. This is correct because Alpaca doesn't know about our models —
+        it only has one aggregated position per symbol.
+
+        For each symbol:
+        - If Alpaca has 0 but DB has positions: zero all, credit capital back
+        - If DB total > Alpaca qty: proportionally reduce all models' positions
+        - If DB total == Alpaca qty: no changes needed
+        - If DB total < Alpaca qty: log warning (untracked position)
 
         Returns summary dict of changes made.
         """
@@ -706,73 +752,96 @@ class ExecutionHandler:
             }
 
         db = get_session(self.config.db_path)
-        changes = {"zeroed": [], "adjusted": [], "alpaca_positions": len(alpaca_positions)}
+        changes = {"zeroed": [], "adjusted": [], "untracked": [], "alpaca_positions": len(alpaca_positions)}
         try:
             # Get all DB positions with quantity > 0
             db_positions = db.query(Position).filter(Position.quantity > 0).all()
 
+            # Group DB positions by symbol: symbol -> [Position, ...]
+            from collections import defaultdict
+            db_by_symbol: dict[str, list] = defaultdict(list)
             for pos in db_positions:
-                alpaca_pos = alpaca_by_symbol.get(pos.symbol)
+                db_by_symbol[pos.symbol].append(pos)
 
-                if alpaca_pos is None:
-                    # Phantom position: exists in DB but not on Alpaca
-                    logger.warning(
-                        f"Reconcile: zeroing phantom position model {pos.model_id} "
-                        f"{pos.symbol} qty={pos.quantity:.4f} "
-                        f"(avg_entry={pos.avg_entry_price:.2f})"
-                    )
-                    # Credit back the cost basis to model capital
-                    model = db.query(TradingModel).get(pos.model_id)
-                    if model:
-                        cost_basis = pos.avg_entry_price * pos.quantity
-                        model.current_capital += cost_basis
-                        logger.info(
-                            f"Reconcile: credited ${cost_basis:.2f} back to "
-                            f"model {pos.model_id} capital"
-                        )
-                    pos.quantity = 0
-                    pos.avg_entry_price = 0.0
-                    pos.unrealized_pnl = 0.0
-                    pos.current_price = 0.0
-                    pos.updated_at = datetime.utcnow()
-                    changes["zeroed"].append({
-                        "model_id": pos.model_id,
-                        "symbol": pos.symbol,
-                    })
+            # Check each symbol that has DB positions
+            for symbol, positions in db_by_symbol.items():
+                db_total = sum(p.quantity for p in positions)
+                alpaca_pos = alpaca_by_symbol.get(symbol)
+                alpaca_qty = alpaca_pos["qty"] if alpaca_pos else 0.0
 
-                elif abs(alpaca_pos["qty"] - pos.quantity) > 0.001:
-                    # Quantity mismatch
-                    old_qty = pos.quantity
-                    pos.quantity = alpaca_pos["qty"]
-                    pos.avg_entry_price = alpaca_pos["avg_entry_price"]
-                    pos.current_price = alpaca_pos["current_price"]
-                    pos.unrealized_pnl = (
-                        (alpaca_pos["current_price"] - alpaca_pos["avg_entry_price"])
-                        * alpaca_pos["qty"]
-                    )
-                    pos.updated_at = datetime.utcnow()
-
-                    # Adjust capital for the quantity difference
-                    qty_diff = old_qty - alpaca_pos["qty"]
-                    if qty_diff > 0:
+                if alpaca_qty < 0.001 and db_total > 0:
+                    # Alpaca has nothing — zero ALL DB positions for this symbol
+                    for pos in positions:
                         model = db.query(TradingModel).get(pos.model_id)
                         if model:
-                            credit = qty_diff * alpaca_pos["avg_entry_price"]
-                            model.current_capital += credit
+                            cost_basis = pos.avg_entry_price * pos.quantity
+                            model.current_capital += cost_basis
                             logger.info(
-                                f"Reconcile: adjusted model {pos.model_id} capital "
-                                f"+${credit:.2f} for {pos.symbol} qty diff"
+                                f"Reconcile: credited ${cost_basis:.2f} back to "
+                                f"model {pos.model_id} for phantom {symbol}"
                             )
+                        logger.warning(
+                            f"Reconcile: zeroing phantom position model {pos.model_id} "
+                            f"{symbol} qty={pos.quantity:.4f}"
+                        )
+                        pos.quantity = 0
+                        pos.avg_entry_price = 0.0
+                        pos.unrealized_pnl = 0.0
+                        pos.current_price = 0.0
+                        pos.updated_at = datetime.utcnow()
+                        changes["zeroed"].append({
+                            "model_id": pos.model_id, "symbol": symbol,
+                        })
 
+                elif db_total > alpaca_qty + 0.001:
+                    # DB claims more than Alpaca has — proportionally reduce
+                    ratio = alpaca_qty / db_total
                     logger.warning(
-                        f"Reconcile: adjusted position model {pos.model_id} "
-                        f"{pos.symbol} qty {old_qty:.4f} -> {alpaca_pos['qty']:.4f}"
+                        f"Reconcile: {symbol} DB total {db_total:.4f} > "
+                        f"Alpaca {alpaca_qty:.4f}, scaling by {ratio:.4f}"
                     )
-                    changes["adjusted"].append({
-                        "model_id": pos.model_id,
-                        "symbol": pos.symbol,
-                        "old_qty": old_qty,
-                        "new_qty": alpaca_pos["qty"],
+                    for pos in positions:
+                        old_qty = pos.quantity
+                        new_qty = round(pos.quantity * ratio, 4)
+                        excess = old_qty - new_qty
+                        if excess > 0.0001:
+                            model = db.query(TradingModel).get(pos.model_id)
+                            if model:
+                                credit = excess * pos.avg_entry_price
+                                model.current_capital += credit
+                            logger.info(
+                                f"Reconcile: model {pos.model_id} {symbol} "
+                                f"qty {old_qty:.4f} -> {new_qty:.4f} "
+                                f"(excess {excess:.4f} credited back)"
+                            )
+                        pos.quantity = new_qty
+                        if new_qty < 0.001:
+                            pos.quantity = 0
+                            pos.avg_entry_price = 0.0
+                        if alpaca_pos:
+                            pos.current_price = alpaca_pos["current_price"]
+                            pos.unrealized_pnl = (
+                                (alpaca_pos["current_price"] - pos.avg_entry_price)
+                                * pos.quantity
+                            )
+                        pos.updated_at = datetime.utcnow()
+                        changes["adjusted"].append({
+                            "model_id": pos.model_id, "symbol": symbol,
+                            "old_qty": old_qty, "new_qty": pos.quantity,
+                        })
+
+                # db_total <= alpaca_qty: all good (or untracked — checked below)
+
+            # Check for Alpaca positions not in DB at all
+            db_symbols = set(db_by_symbol.keys())
+            for symbol, apos in alpaca_by_symbol.items():
+                if symbol not in db_symbols:
+                    logger.warning(
+                        f"Reconcile: untracked Alpaca position {symbol} "
+                        f"qty={apos['qty']:.4f} (not in DB)"
+                    )
+                    changes["untracked"].append({
+                        "symbol": symbol, "qty": apos["qty"],
                     })
 
             db.commit()
@@ -780,8 +849,9 @@ class ExecutionHandler:
             total_changes = len(changes["zeroed"]) + len(changes["adjusted"])
             if total_changes:
                 logger.info(
-                    f"Reconciliation complete: zeroed {len(changes['zeroed'])} phantom positions, "
-                    f"adjusted {len(changes['adjusted'])} mismatches"
+                    f"Reconciliation complete: zeroed {len(changes['zeroed'])}, "
+                    f"adjusted {len(changes['adjusted'])}, "
+                    f"untracked {len(changes['untracked'])}"
                 )
             else:
                 logger.info("Reconciliation complete: DB positions match Alpaca")

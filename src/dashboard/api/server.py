@@ -184,8 +184,6 @@ def _get_live_model_data() -> list[dict]:
 
         capital = strategy.current_capital
         initial = record.initial_capital or 1000.0
-        total_pnl = capital - initial
-        return_pct = (total_pnl / initial) * 100 if initial > 0 else 0
 
         # Build positions from strategy state + last known prices
         positions = []
@@ -212,7 +210,14 @@ def _get_live_model_data() -> list[dict]:
                 total_trades = metrics.total_trades
                 win_rate = metrics.win_rate
 
-        equity = capital + sum(p["unrealized_pnl"] for p in positions)
+        # Equity = cash + position market value (cost basis + unrealized).
+        # Realized P&L = (cash + cost basis) - initial (excludes unrealized).
+        # Total return = (equity - initial) / initial.
+        unrealized_total = sum(p["unrealized_pnl"] for p in positions)
+        position_cost = sum(p["avg_entry"] * p["quantity"] for p in positions)
+        equity = capital + position_cost + unrealized_total
+        total_pnl = (capital + position_cost) - initial  # realized only
+        return_pct = ((equity - initial) / initial) * 100 if initial > 0 else 0
 
         models_data.append({
             "id": model_id,
@@ -229,7 +234,7 @@ def _get_live_model_data() -> list[dict]:
                 "return_pct": round(return_pct, 2),
                 "sharpe_ratio": 0,
                 "max_drawdown": 0,
-                "win_rate": round(win_rate, 1),
+                "win_rate": round(win_rate * 100, 1),
                 "total_trades": total_trades,
                 "session_number": arena._session_number,
             },
@@ -386,7 +391,7 @@ def get_dashboard_data(session_date: str | None = None) -> dict:
                     "return_pct": snapshot.return_pct if snapshot else 0,
                     "sharpe_ratio": snapshot.sharpe_ratio if snapshot else 0,
                     "max_drawdown": snapshot.max_drawdown if snapshot else 0,
-                    "win_rate": snapshot.win_rate if snapshot else 0,
+                    "win_rate": round((snapshot.win_rate or 0) * 100, 1) if snapshot else 0,
                     "total_trades": snapshot.total_trades if snapshot else 0,
                     "session_number": snapshot.session_number if snapshot else None,
                 } if snapshot else None,
@@ -407,7 +412,7 @@ def get_dashboard_data(session_date: str | None = None) -> dict:
                         "unrealized_pnl": p.unrealized_pnl,
                     }
                     for p in positions
-                    if p.quantity != 0
+                    if p.quantity > 0.001
                 ],
             })
 
@@ -733,7 +738,7 @@ async def session_performance(session_date: str, session_number: Optional[int] =
                 "sharpe": s.sharpe_ratio,
                 "drawdown": s.max_drawdown,
                 "trades": s.total_trades,
-                "win_rate": s.win_rate,
+                "win_rate": round((s.win_rate or 0) * 100, 1),
                 "session_number": s.session_number,
             })
         return list(by_model.values())
@@ -769,7 +774,7 @@ async def model_summaries(session_date: str, session_number: Optional[int] = Non
                 "sharpe_ratio": s.sharpe_ratio,
                 "max_drawdown": s.max_drawdown,
                 "total_trades": s.total_trades,
-                "win_rate": s.win_rate,
+                "win_rate": round((s.win_rate or 0) * 100, 1),
                 "fitness": s.fitness,
                 "rank": s.rank,
                 "param_changes": s.param_changes,
@@ -788,16 +793,21 @@ async def model_trades(model_id: int, session_date: Optional[str] = None):
 
     db = get_dashboard_session(DB_PATH)
     try:
-        orders = (
+        order_query = (
             db.query(Order)
             .filter(
                 Order.model_id == model_id,
                 Order.session_date == session_date,
                 Order.status == OrderStatus.FILLED,
             )
-            .order_by(Order.filled_at.asc())
-            .all()
         )
+        # If arena is running, scope to current session start time to exclude
+        # stale fills from previous (reset) sessions on the same date.
+        if _arena_instance and hasattr(_arena_instance, 'tracker') and _arena_instance.tracker._session_start_utc:
+            order_query = order_query.filter(
+                Order.filled_at >= _arena_instance.tracker._session_start_utc
+            )
+        orders = order_query.order_by(Order.filled_at.asc()).all()
 
         # Group orders by symbol, then pair buys with sells chronologically
         # Use a separate dict to track remaining qty (never mutate ORM objects)
@@ -945,6 +955,51 @@ async def arena_stop():
 
     logger.info("Arena stopped via API")
     return {"status": "stopped"}
+
+
+@app.post("/api/arena/set-cfa")
+async def arena_set_cfa(enable: bool = True):
+    """Enable or disable CFA review for the current running session."""
+    global _arena_instance
+    if _arena_instance is None:
+        return {"status": "error", "message": "Arena not running"}
+    _arena_instance._skip_cfa = not enable
+    logger.info(f"CFA review {'enabled' if enable else 'disabled'} via API (skip_cfa={_arena_instance._skip_cfa})")
+    return {"status": "ok", "skip_cfa": _arena_instance._skip_cfa}
+
+
+@app.post("/api/cfa-review/run")
+async def run_cfa_review_manual():
+    """Manually trigger CFA review. Uses arena instance if available, otherwise standalone."""
+    global _arena_instance
+    config = Config.load()
+
+    if _arena_instance is not None and _arena_instance._running:
+        # Use the live arena's context (session_date, incident_notes)
+        try:
+            await _arena_instance._run_cfa_review()
+            return {"status": "ok", "source": "arena_instance"}
+        except Exception as e:
+            logger.error(f"CFA review via arena failed: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # Standalone: run CFA for today's date
+    from datetime import date
+    session_date = date.today().isoformat()
+    try:
+        review = await asyncio.to_thread(
+            run_cfa_review,
+            config.db_path,
+            session_date,
+            config.arena.cfa_review_model,
+            config.arena.cfa_review_timeout_sec,
+            config.arena.cfa_review_lookback_days,
+            "",
+        )
+        return {"status": "ok", "source": "standalone", "has_review": review is not None}
+    except Exception as e:
+        logger.error(f"Standalone CFA review failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/cfa-review/{session_date}")

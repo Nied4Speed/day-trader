@@ -5,95 +5,145 @@ import logging
 import math
 
 class CfaGeneratedStrategy(Strategy):
-    """Aggressive quick-start strategy designed to trade with minimal data requirements.
+    """Multi-regime adaptive strategy using volume profile and momentum divergence.
     
     Key improvements from previous version:
-    1. Reduced lookback requirements (5-10 bars vs 20-50)
-    2. More aggressive entry signals to ensure trading activity
-    3. Time-of-day awareness to avoid illiquid periods
-    4. Simplified logic for faster decision making
+    1. Volume profile analysis to identify institutional activity
+    2. Regime detection to adapt to trending vs ranging markets  
+    3. Momentum divergence detection for high-probability reversals
+    4. Strict risk management with dynamic position sizing
+    5. Post-stop-loss cooldown to prevent re-entry bleeding
     """
     
     strategy_type = "cfa_generated"
     
     def __init__(self, name, params=None):
-        # Quick indicators with minimal lookback
-        self.fast_ma = 5
-        self.slow_ma = 10
-        self.rsi_period = 6  # Reduced from 14
-        self.rsi_oversold = 35.0  # Raised from 28
-        self.rsi_overbought = 65.0  # Lowered from 72
+        # Volume profile parameters
+        self.volume_lookback = 20  # Bars for volume analysis
+        self.volume_threshold = 1.5  # Institutional activity threshold
+        self.vwap_deviation = 0.002  # Distance from VWAP for mean reversion
         
-        # Volume spike detection
-        self.volume_lookback = 5  # Only need 5 bars
-        self.volume_spike = 1.5  # 50% above average
+        # Momentum parameters
+        self.fast_momentum = 5  # Fast momentum period
+        self.slow_momentum = 15  # Slow momentum period  
+        self.divergence_threshold = 0.003  # Momentum divergence threshold
         
-        # Momentum detection
-        self.momentum_bars = 3  # Very short-term momentum
-        self.momentum_threshold = 0.002  # 0.2% move
+        # Regime detection
+        self.atr_period = 10  # ATR for volatility regime
+        self.trend_period = 20  # Period for trend strength
+        self.regime_threshold = 0.6  # Trend strength threshold
         
-        # Risk and position parameters
-        self.allocation_pct = 0.25
-        self.max_positions = 4  # Increased from 3
-        self.min_bars_held = 2  # Reduced from 3
-        self.stop_loss_pct = 2.0  # 2% stop loss (percentage points, consistent with base class)
-        self.take_profit_pct = 3.0  # 3% take profit (percentage points, consistent with base class)
+        # Risk management
+        self.base_allocation = 0.20  # Base position size
+        self.max_positions = 3  # Maximum concurrent positions
+        self.stop_loss_pct = 1.5  # Tighter stop loss
+        self.take_profit_pct = 2.5  # Reasonable profit target
+        self.stop_cooldown_bars = 10  # Bars to wait after stop loss
         
-        # Time-based filters
-        self.min_minutes_after_open = 5  # Wait 5 minutes after open
-        self.min_minutes_before_close = 10  # Stop trading 10 min before close
+        # Entry filters
+        self.min_price = 5.0  # Avoid penny stocks
+        self.min_volume = 1000000  # Minimum daily volume
+        self.min_bars = 30  # Minimum history required
         
         super().__init__(name, params)
-        self.entry_prices = {}  # Track entry prices for profit targets
-        self.bars_held = {}  # Track holding period
+        self.entry_prices = {}  # Track entry prices
+        self.stop_loss_triggered = {}  # Track stop losses by symbol
+        self.regime_state = {}  # Track regime by symbol
     
-    def _is_valid_trading_time(self, bar):
-        """Check if current time is appropriate for trading."""
-        # Simple check based on minutes remaining
-        # Assuming ~390 minute session, avoid first 5 and last 10 minutes
-        if bar.minutes_remaining < self.min_minutes_before_close:
-            return False
-        if bar.minutes_remaining > 385:  # Within first 5 minutes
-            return False
-        return True
+    def _calculate_vwap(self, bars):
+        """Calculate volume-weighted average price."""
+        if not bars:
+            return None
+        
+        total_volume = sum(b.volume for b in bars)
+        if total_volume == 0:
+            return bars[-1].close
+        
+        vwap = sum(b.close * b.volume for b in bars) / total_volume
+        return vwap
     
-    def _compute_rsi(self, closes):
-        """Fast RSI calculation."""
-        if len(closes) < self.rsi_period + 1:
-            return 50.0
-        
-        deltas = closes.diff().dropna()
-        gains = deltas.where(deltas > 0, 0.0)
-        losses = -deltas.where(deltas < 0, 0.0)
-        
-        avg_gain = gains.rolling(self.rsi_period).mean().iloc[-1]
-        avg_loss = losses.rolling(self.rsi_period).mean().iloc[-1]
-        
-        if avg_loss == 0:
-            return 100.0
-        
-        rs = avg_gain / avg_loss
-        return 100.0 - (100.0 / (1.0 + rs))
-    
-    def _detect_volume_spike(self, volumes):
-        """Detect if current volume is elevated."""
-        if len(volumes) < self.volume_lookback:
-            return False
-        
-        avg_volume = volumes[-self.volume_lookback:-1].mean()
-        current_volume = volumes.iloc[-1]
-        
-        return current_volume > (avg_volume * self.volume_spike)
-    
-    def _calculate_momentum(self, closes):
-        """Calculate short-term price momentum."""
-        if len(closes) < self.momentum_bars:
+    def _calculate_atr(self, bars):
+        """Calculate Average True Range for volatility."""
+        if len(bars) < 2:
             return 0.0
         
-        old_price = closes.iloc[-self.momentum_bars]
-        new_price = closes.iloc[-1]
+        trs = []
+        for i in range(1, len(bars)):
+            high_low = bars[i].high - bars[i].low
+            high_close = abs(bars[i].high - bars[i-1].close)
+            low_close = abs(bars[i].low - bars[i-1].close)
+            trs.append(max(high_low, high_close, low_close))
         
-        return (new_price - old_price) / old_price
+        if len(trs) >= self.atr_period:
+            return np.mean(trs[-self.atr_period:])
+        elif trs:
+            return np.mean(trs)
+        return 0.0
+    
+    def _detect_regime(self, bars):
+        """Detect market regime: trending or ranging."""
+        if len(bars) < self.trend_period:
+            return 'unknown'
+        
+        closes = pd.Series([b.close for b in bars[-self.trend_period:]])
+        
+        # Linear regression slope
+        x = np.arange(len(closes))
+        slope = np.polyfit(x, closes.values, 1)[0]
+        
+        # Normalize by price level
+        avg_price = closes.mean()
+        normalized_slope = slope / avg_price
+        
+        # R-squared for trend strength
+        y_pred = np.polyval(np.polyfit(x, closes.values, 1), x)
+        ss_res = np.sum((closes.values - y_pred) ** 2)
+        ss_tot = np.sum((closes.values - closes.mean()) ** 2)
+        r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+        
+        # Strong trend if high R-squared and significant slope
+        if r_squared > self.regime_threshold:
+            if normalized_slope > 0.001:
+                return 'uptrend'
+            elif normalized_slope < -0.001:
+                return 'downtrend'
+        
+        return 'ranging'
+    
+    def _calculate_momentum_divergence(self, bars):
+        """Detect momentum divergence for reversal signals."""
+        if len(bars) < self.slow_momentum:
+            return 0.0
+        
+        closes = pd.Series([b.close for b in bars])
+        
+        # Calculate momentum
+        fast_mom = (closes.iloc[-1] - closes.iloc[-self.fast_momentum]) / closes.iloc[-self.fast_momentum]
+        slow_mom = (closes.iloc[-1] - closes.iloc[-self.slow_momentum]) / closes.iloc[-self.slow_momentum]
+        
+        # Divergence: fast momentum weakening relative to slow
+        divergence = fast_mom - slow_mom
+        return divergence
+    
+    def _is_institutional_volume(self, current_volume, avg_volume):
+        """Check if current volume indicates institutional activity."""
+        if avg_volume == 0:
+            return False
+        return current_volume > (avg_volume * self.volume_threshold)
+    
+    def _check_cooldown(self, symbol, bar):
+        """Check if symbol is in post-stop-loss cooldown."""
+        if symbol not in self.stop_loss_triggered:
+            return False
+        
+        bars_since_stop = self.stop_loss_triggered[symbol]
+        if bars_since_stop < self.stop_cooldown_bars:
+            self.stop_loss_triggered[symbol] += 1
+            return True
+        else:
+            # Cooldown expired
+            del self.stop_loss_triggered[symbol]
+            return False
     
     def on_bar(self, bar: BarData):
         self.record_bar(bar)
@@ -101,190 +151,212 @@ class CfaGeneratedStrategy(Strategy):
         # Check for liquidation
         liq = self.check_liquidation(bar)
         if liq:
-            # Clean up tracking
             if bar.symbol in self.entry_prices:
                 del self.entry_prices[bar.symbol]
-            if bar.symbol in self.bars_held:
-                del self.bars_held[bar.symbol]
             return liq if liq.quantity > 0 else None
         
-        # Skip if not valid trading time
-        if not self._is_valid_trading_time(bar):
+        # Skip if in cooldown
+        if self._check_cooldown(bar.symbol, bar):
             return None
         
-        # Update holding period
-        if bar.symbol in self._positions and self._positions[bar.symbol] > 0:
-            self.bars_held[bar.symbol] = self.bars_held.get(bar.symbol, 0) + 1
-        
-        # Get minimal data needed
-        history = self.get_history(bar.symbol, lookback=self.slow_ma)
-        if len(history) < self.slow_ma:
+        # Skip if price/volume filters not met
+        if bar.close < self.min_price or bar.volume < self.min_volume:
             return None
         
-        closes = pd.Series([b.close for b in history])
-        volumes = pd.Series([b.volume for b in history])
+        # Get history
+        history = self.get_history(bar.symbol, lookback=max(self.volume_lookback, self.trend_period))
+        if len(history) < self.min_bars:
+            return None
         
         # Calculate indicators
-        fast_ma_val = closes[-self.fast_ma:].mean()
-        slow_ma_val = closes.mean()
-        rsi = self._compute_rsi(closes)
-        volume_spike = self._detect_volume_spike(volumes)
-        momentum = self._calculate_momentum(closes)
+        vwap = self._calculate_vwap(history[-self.volume_lookback:])
+        atr = self._calculate_atr(history)
+        regime = self._detect_regime(history)
+        divergence = self._calculate_momentum_divergence(history)
         
+        # Volume analysis
+        recent_volumes = [b.volume for b in history[-self.volume_lookback:-1]]
+        avg_volume = np.mean(recent_volumes) if recent_volumes else bar.volume
+        institutional_volume = self._is_institutional_volume(bar.volume, avg_volume)
+        
+        # Current position
         current_position = self._positions.get(bar.symbol, 0)
         current_price = bar.close
+        
+        # Store regime
+        self.regime_state[bar.symbol] = regime
         
         # EXIT LOGIC
         if current_position > 0:
             entry_price = self.entry_prices.get(bar.symbol, current_price)
-            pnl_pct = (current_price - entry_price) / entry_price
-            bars = self.bars_held.get(bar.symbol, 0)
+            pnl_pct = (current_price - entry_price) / entry_price * 100.0
             
-            # Exit conditions
             should_exit = False
+            exit_reason = ""
             
-            # 1. Stop loss (pnl_pct is a fraction, stop_loss_pct is percentage points)
-            if pnl_pct * 100.0 <= -self.stop_loss_pct:
+            # 1. Stop loss
+            if pnl_pct <= -self.stop_loss_pct:
                 should_exit = True
-                logging.info(f"Stop loss triggered for {bar.symbol} at {pnl_pct:.2%}")
-
+                exit_reason = "stop_loss"
+                self.stop_loss_triggered[bar.symbol] = 0  # Start cooldown
+            
             # 2. Take profit
-            elif pnl_pct * 100.0 >= self.take_profit_pct:
+            elif pnl_pct >= self.take_profit_pct:
                 should_exit = True
-                logging.info(f"Take profit triggered for {bar.symbol} at {pnl_pct:.2%}")
+                exit_reason = "take_profit"
             
-            # 3. Technical exit signals
-            elif bars >= self.min_bars_held:
-                # Exit on MA crossover down
-                if fast_ma_val < slow_ma_val:
-                    should_exit = True
-                # Exit on RSI overbought
-                elif rsi > self.rsi_overbought:
-                    should_exit = True
-                # Exit on momentum reversal
-                elif momentum < -self.momentum_threshold:
-                    should_exit = True
+            # 3. Regime change exit
+            elif regime == 'downtrend' and entry_price < current_price:
+                should_exit = True
+                exit_reason = "regime_change"
+            
+            # 4. Momentum divergence exit
+            elif divergence < -self.divergence_threshold and pnl_pct > 0:
+                should_exit = True
+                exit_reason = "divergence"
+            
+            # 5. VWAP reversion exit in ranging market
+            elif regime == 'ranging' and vwap and current_price > vwap * (1 + self.vwap_deviation):
+                should_exit = True
+                exit_reason = "vwap_reversion"
             
             if should_exit:
-                # Clean up tracking
                 if bar.symbol in self.entry_prices:
                     del self.entry_prices[bar.symbol]
-                if bar.symbol in self.bars_held:
-                    del self.bars_held[bar.symbol]
+                logging.info(f"Exit {bar.symbol} - {exit_reason}: {pnl_pct:.2f}% PnL")
                 return TradeSignal(symbol=bar.symbol, side="sell", quantity=current_position)
         
         # ENTRY LOGIC
         elif current_position == 0 and len(self._positions) < self.max_positions:
             should_enter = False
+            entry_reason = ""
             
-            # 1. MA crossover with momentum
-            if fast_ma_val > slow_ma_val and momentum > self.momentum_threshold:
-                should_enter = True
+            # Dynamic position sizing based on volatility
+            if atr > 0:
+                volatility_scalar = min(1.5, max(0.5, 1.0 / (atr / current_price)))
+                position_size = self.base_allocation * volatility_scalar
+            else:
+                position_size = self.base_allocation
             
-            # 2. Oversold bounce with volume
-            elif rsi < self.rsi_oversold and volume_spike:
+            # 1. Trend following with volume confirmation
+            if regime == 'uptrend' and institutional_volume:
                 should_enter = True
+                entry_reason = "trend_volume"
             
-            # 3. Strong momentum with volume
-            elif momentum > self.momentum_threshold * 2 and volume_spike:
-                should_enter = True
+            # 2. Mean reversion in ranging market
+            elif regime == 'ranging' and vwap:
+                if current_price < vwap * (1 - self.vwap_deviation) and divergence > 0:
+                    should_enter = True
+                    entry_reason = "vwap_reversion_long"
             
-            # 4. Simple RSI + MA alignment
-            elif rsi < 40 and fast_ma_val > slow_ma_val:
-                should_enter = True
+            # 3. Momentum divergence reversal
+            elif abs(divergence) > self.divergence_threshold:
+                if divergence > 0 and institutional_volume:
+                    should_enter = True
+                    entry_reason = "bullish_divergence"
+            
+            # 4. Breakout with volume
+            elif len(history) > 20:
+                twenty_bar_high = max(b.high for b in history[-20:])
+                if current_price > twenty_bar_high * 0.995 and institutional_volume:
+                    should_enter = True
+                    entry_reason = "breakout"
             
             if should_enter:
-                qty = self.compute_quantity(current_price, self.allocation_pct)
+                qty = self.compute_quantity(current_price, position_size)
                 if qty > 0:
                     self.entry_prices[bar.symbol] = current_price
-                    self.bars_held[bar.symbol] = 0
-                    logging.info(f"Entering {bar.symbol} at {current_price:.2f}, RSI={rsi:.1f}, momentum={momentum:.3%}")
+                    logging.info(f"Enter {bar.symbol} - {entry_reason}: regime={regime}, vol_spike={institutional_volume}")
                     return TradeSignal(symbol=bar.symbol, side="buy", quantity=qty)
         
         return None
     
     def get_params(self):
         return {
-            "fast_ma": self.fast_ma,
-            "slow_ma": self.slow_ma,
-            "rsi_period": self.rsi_period,
-            "rsi_oversold": self.rsi_oversold,
-            "rsi_overbought": self.rsi_overbought,
             "volume_lookback": self.volume_lookback,
-            "volume_spike": self.volume_spike,
-            "momentum_bars": self.momentum_bars,
-            "momentum_threshold": self.momentum_threshold,
-            "allocation_pct": self.allocation_pct,
+            "volume_threshold": self.volume_threshold,
+            "vwap_deviation": self.vwap_deviation,
+            "fast_momentum": self.fast_momentum,
+            "slow_momentum": self.slow_momentum,
+            "divergence_threshold": self.divergence_threshold,
+            "atr_period": self.atr_period,
+            "trend_period": self.trend_period,
+            "regime_threshold": self.regime_threshold,
+            "base_allocation": self.base_allocation,
             "max_positions": self.max_positions,
-            "min_bars_held": self.min_bars_held,
             "stop_loss_pct": self.stop_loss_pct,
             "take_profit_pct": self.take_profit_pct,
-            "min_minutes_after_open": self.min_minutes_after_open,
-            "min_minutes_before_close": self.min_minutes_before_close
+            "stop_cooldown_bars": self.stop_cooldown_bars,
+            "min_price": self.min_price,
+            "min_volume": self.min_volume,
+            "min_bars": self.min_bars
         }
     
     def set_params(self, params):
-        # MA parameters
-        self.fast_ma = max(2, min(10, int(params.get("fast_ma", self.fast_ma))))
-        self.slow_ma = max(5, min(20, int(params.get("slow_ma", self.slow_ma))))
-        
-        # RSI parameters
-        self.rsi_period = max(3, min(14, int(params.get("rsi_period", self.rsi_period))))
-        self.rsi_oversold = max(20.0, min(45.0, float(params.get("rsi_oversold", self.rsi_oversold))))
-        self.rsi_overbought = max(55.0, min(80.0, float(params.get("rsi_overbought", self.rsi_overbought))))
-        
         # Volume parameters
-        self.volume_lookback = max(3, min(10, int(params.get("volume_lookback", self.volume_lookback))))
-        self.volume_spike = max(1.1, min(3.0, float(params.get("volume_spike", self.volume_spike))))
+        self.volume_lookback = max(10, min(50, int(params.get("volume_lookback", self.volume_lookback))))
+        self.volume_threshold = max(1.1, min(3.0, float(params.get("volume_threshold", self.volume_threshold))))
+        self.vwap_deviation = max(0.001, min(0.01, float(params.get("vwap_deviation", self.vwap_deviation))))
         
         # Momentum parameters
-        self.momentum_bars = max(2, min(5, int(params.get("momentum_bars", self.momentum_bars))))
-        self.momentum_threshold = max(0.001, min(0.01, float(params.get("momentum_threshold", self.momentum_threshold))))
+        self.fast_momentum = max(3, min(10, int(params.get("fast_momentum", self.fast_momentum))))
+        self.slow_momentum = max(10, min(30, int(params.get("slow_momentum", self.slow_momentum))))
+        self.divergence_threshold = max(0.001, min(0.01, float(params.get("divergence_threshold", self.divergence_threshold))))
         
-        # Position parameters
-        self.allocation_pct = max(0.1, min(0.5, float(params.get("allocation_pct", self.allocation_pct))))
-        self.max_positions = max(1, min(6, int(params.get("max_positions", self.max_positions))))
-        self.min_bars_held = max(1, min(5, int(params.get("min_bars_held", self.min_bars_held))))
+        # Regime parameters
+        self.atr_period = max(5, min(20, int(params.get("atr_period", self.atr_period))))
+        self.trend_period = max(10, min(50, int(params.get("trend_period", self.trend_period))))
+        self.regime_threshold = max(0.3, min(0.9, float(params.get("regime_threshold", self.regime_threshold))))
         
-        # Risk parameters (percentage points: 2.0 = 2%)
-        self.stop_loss_pct = max(0.5, min(5.0, float(params.get("stop_loss_pct", self.stop_loss_pct))))
-        self.take_profit_pct = max(1.0, min(10.0, float(params.get("take_profit_pct", self.take_profit_pct))))
+        # Risk parameters
+        self.base_allocation = max(0.05, min(0.3, float(params.get("base_allocation", self.base_allocation))))
+        self.max_positions = max(1, min(5, int(params.get("max_positions", self.max_positions))))
+        self.stop_loss_pct = max(0.5, min(3.0, float(params.get("stop_loss_pct", self.stop_loss_pct))))
+        self.take_profit_pct = max(1.0, min(5.0, float(params.get("take_profit_pct", self.take_profit_pct))))
+        self.stop_cooldown_bars = max(5, min(30, int(params.get("stop_cooldown_bars", self.stop_cooldown_bars))))
         
-        # Time parameters
-        self.min_minutes_after_open = max(0, min(30, int(params.get("min_minutes_after_open", self.min_minutes_after_open))))
-        self.min_minutes_before_close = max(5, min(30, int(params.get("min_minutes_before_close", self.min_minutes_before_close))))
+        # Filter parameters
+        self.min_price = max(1.0, min(20.0, float(params.get("min_price", self.min_price))))
+        self.min_volume = max(100000, min(10000000, int(params.get("min_volume", self.min_volume))))
+        self.min_bars = max(20, min(100, int(params.get("min_bars", self.min_bars))))
     
     def adapt(self, recent_signals, recent_fills, realized_pnl):
-        """Dynamically adjust parameters based on performance."""
+        """Adapt parameters based on recent performance."""
         if not recent_fills:
-            # If no recent trades, make parameters more aggressive
-            self.rsi_oversold = min(45.0, self.rsi_oversold + 2.0)
-            self.rsi_overbought = max(55.0, self.rsi_overbought - 2.0)
-            self.momentum_threshold = max(0.001, self.momentum_threshold - 0.0005)
-            logging.info("No recent trades - making parameters more aggressive")
+            # No trades - loosen filters
+            self.volume_threshold = max(1.1, self.volume_threshold - 0.1)
+            self.min_volume = max(100000, self.min_volume - 100000)
+            logging.info("Loosening filters due to lack of trades")
             return
         
-        # Calculate performance metrics
-        wins = [f for f in recent_fills if f.get('realized_pnl', 0) > 0]
-        losses = [f for f in recent_fills if f.get('realized_pnl', 0) < 0]
-        win_rate = len(wins) / len(recent_fills) if recent_fills else 0
+        # Analyze regime performance
+        regime_performance = {}
+        for fill in recent_fills:
+            symbol = fill.get('symbol')
+            pnl = fill.get('realized_pnl', 0)
+            regime = self.regime_state.get(symbol, 'unknown')
+            
+            if regime not in regime_performance:
+                regime_performance[regime] = []
+            regime_performance[regime].append(pnl)
         
-        # Adjust based on win rate
-        if win_rate < 0.3:
-            # Poor performance - widen stops, be more selective
-            self.stop_loss_pct = min(5.0, self.stop_loss_pct + 0.5)
-            self.momentum_threshold = min(0.01, self.momentum_threshold + 0.0005)
-            self.rsi_oversold = max(20.0, self.rsi_oversold - 2.0)
-        elif win_rate > 0.6:
-            # Good performance - can be slightly more aggressive
-            self.stop_loss_pct = max(1.0, self.stop_loss_pct - 0.2)
-            self.take_profit_pct = min(5.0, self.take_profit_pct + 0.2)
-            self.max_positions = min(6, self.max_positions + 1)
+        # Adjust based on regime success
+        for regime, pnls in regime_performance.items():
+            avg_pnl = np.mean(pnls)
+            if regime == 'trending' and avg_pnl < 0:
+                # Trend following not working - tighten criteria
+                self.regime_threshold = min(0.9, self.regime_threshold + 0.05)
+            elif regime == 'ranging' and avg_pnl > 0:
+                # Mean reversion working - widen VWAP bands
+                self.vwap_deviation = min(0.01, self.vwap_deviation + 0.0005)
         
-        # Adjust based on realized PnL
-        if realized_pnl < -50:  # Lost more than $50
-            self.allocation_pct = max(0.1, self.allocation_pct - 0.05)
-            logging.info(f"Reduced allocation to {self.allocation_pct:.1%} after losses")
-        elif realized_pnl > 100:  # Made more than $100
-            self.allocation_pct = min(0.4, self.allocation_pct + 0.05)
-            logging.info(f"Increased allocation to {self.allocation_pct:.1%} after gains")
+        # Overall performance adjustments
+        if realized_pnl < -20:
+            # Tighten risk
+            self.stop_loss_pct = max(0.5, self.stop_loss_pct - 0.25)
+            self.base_allocation = max(0.05, self.base_allocation - 0.02)
+            logging.info(f"Tightened risk: stop={self.stop_loss_pct}%, allocation={self.base_allocation:.1%}")
+        elif realized_pnl > 50:
+            # Loosen profit targets to let winners run
+            self.take_profit_pct = min(5.0, self.take_profit_pct + 0.25)
+            logging.info(f"Increased profit target to {self.take_profit_pct}%")

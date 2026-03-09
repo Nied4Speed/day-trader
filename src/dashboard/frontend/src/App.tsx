@@ -49,9 +49,9 @@ export default function App() {
 
   // Portfolio aggregates
   const totals = useMemo(() => {
-    let capital = 0, pnl = 0, unrealized = 0, posCount = 0
+    let equity = 0, pnl = 0, unrealized = 0, posCount = 0
     for (const m of models) {
-      capital += m.current_capital
+      equity += m.performance?.equity ?? m.current_capital
       pnl += m.performance?.total_pnl ?? 0
       for (const p of m.positions) {
         unrealized += p.unrealized_pnl
@@ -59,8 +59,8 @@ export default function App() {
       }
     }
     const initial = models.reduce((s, m) => s + m.initial_capital, 0)
-    const returnPct = initial > 0 ? (pnl / initial) * 100 : 0
-    return { capital, pnl, unrealized, posCount, returnPct }
+    const returnPct = initial > 0 ? ((equity - initial) / initial) * 100 : 0
+    return { equity, pnl, unrealized, posCount, returnPct }
   }, [models])
 
   // Recent trades (last 20, newest first)
@@ -129,7 +129,7 @@ export default function App() {
       <div className="portfolio-strip">
         <div className="portfolio-stat">
           <span className="label">Portfolio</span>
-          <span className="value">{formatMoney(totals.capital)}</span>
+          <span className="value">{formatMoney(totals.equity)}</span>
         </div>
         <div className="portfolio-stat">
           <span className="label">Realized P&L</span>
@@ -182,7 +182,7 @@ function ModelCard({ model: m, allModels }: { model: Model; allModels: Model[] }
   const pnl = perf?.total_pnl ?? 0
   const returnPct = perf?.return_pct ?? 0
   const totalUnrealized = m.positions.reduce((s, p) => s + p.unrealized_pnl, 0)
-  const equity = m.current_capital + totalUnrealized
+  const equity = perf?.equity ?? (m.current_capital + totalUnrealized)
   const desc = getModelDescription(m, allModels)
   const hasTrades = (perf?.total_trades ?? 0) > 0
   const { trades: closedTrades, loading: tradesLoading } = useModelTrades(

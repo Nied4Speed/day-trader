@@ -56,8 +56,8 @@ class ArenaConfig:
     synthetic_bar_interval_sec: float = 15.0  # quote aggregation interval; 0 = disabled
     self_improve_enabled: bool = True  # auto-mutate params between sessions
     cfa_review_enabled: bool = True  # run CFA-style review after last session
-    cfa_review_model: str = "claude-opus-4-20250514"  # Anthropic model for review
-    cfa_review_timeout_sec: int = 120  # API timeout for review call
+    cfa_review_model: str = "claude-sonnet-4-20250514"  # Anthropic model for review
+    cfa_review_timeout_sec: int = 300  # API timeout for review call
     cfa_review_lookback_days: int = 10  # days of history for multi-day trends
     weekly_elimination_count: int = 2  # fixed number of models culled at weekly evolution
     screener_enabled: bool = True  # run pre-market screener to discover hot symbols

@@ -325,7 +325,6 @@ def _gather_review_data(
                 .first()
             )
             start_cap = ledger.start_capital if ledger else m.initial_capital
-            end_cap = ledger.end_capital if ledger else m.current_capital
             daily_ret = ledger.daily_return_pct if ledger else return_pct
 
             # Per-model realized PnL from orders (permanent, survives resets)
@@ -339,6 +338,11 @@ def _gather_review_data(
                 )
                 .scalar() or 0.0
             )
+
+            # Compute equity from realized PnL (not raw cash, which excludes
+            # capital tied up in positions). After EOD liquidation all positions
+            # are closed, so equity = start + realized_pnl.
+            end_cap = start_cap + model_realized
 
             # Parse model parameters for risk control visibility
             params = {}
@@ -365,6 +369,10 @@ def _gather_review_data(
                 "realized_pnl": round(model_realized, 2),
                 "stop_loss_pct": params.get("stop_loss_pct"),
                 "take_profit_pct": params.get("take_profit_pct"),
+                "all_parameters": {
+                    k: v for k, v in params.items()
+                    if not k.startswith("_") and isinstance(v, (int, float, bool))
+                },
             })
 
         model_rows.sort(key=lambda r: r["return_pct"], reverse=True)
@@ -662,7 +670,9 @@ def _gather_review_data(
             },
             "risk_events": {
                 "rejected_orders": len(rejected),
-                "reject_reasons": reject_reasons,
+                "reject_reasons": dict(
+                    sorted(reject_reasons.items(), key=lambda x: -x[1])[:20]
+                ),
             },
             "sessions": [
                 {
@@ -896,6 +906,18 @@ Produce ONLY a JSON object (no markdown, no explanation outside JSON) with this 
       "priority": "critical/high/medium/low",
       "rationale": "why this would improve your strategy's returns or risk management"
     }}
+  ],
+  "parameter_recommendations": [
+    {{
+      "model_name": "<exact model name from the models list>",
+      "recommendations": {{
+        "<param_name>": {{
+          "value": "<number — the target value you recommend>",
+          "confidence": "high|medium|low",
+          "rationale": "evidence-based reason for this change"
+        }}
+      }}
+    }}
   ]
 }}
 
@@ -913,6 +935,13 @@ signal or the session ends. Flag any models with null stop_loss_pct or take_prof
 management concern and recommend they set values (e.g., 2% stop-loss, 3% take-profit) so that
 self-improvement can evolve the thresholds over time.
 
+STOP-LOSS RE-ENTRY PROBLEM: Models currently have no cooldown after a stop-loss fires. A model can
+hit its stop-loss, sell the position, then immediately re-buy the same symbol on the next bar because
+its indicators still say "buy." This creates a cycle of buy->stop-loss->buy->stop-loss that bleeds
+capital through spread/slippage. Consider recommending a post-stop-loss cooldown period (e.g., skip
+the symbol for N bars after a stop-loss fires) or other re-entry discipline for models exhibiting
+this pattern. Check the trade history for rapid buy-sell-buy sequences on the same symbol.
+
 DATA REQUESTS — Your goal is to maximize returns and minimize losses. Include a "data_requests"
 array listing ANY additional data that would help you build a better strategy. Think about what
 a top quantitative fund would want: order book depth, tick-level data, options flow/Greeks,
@@ -921,11 +950,27 @@ news sentiment scores, pre-market/after-hours activity, etc. We can wire up new 
 Be specific about what you want, how you'd use it, and why it would improve performance.
 Your strategy competes against 12 others — tell us what edge you need.
 
+PARAMETER RECOMMENDATIONS — Each model's `all_parameters` dict shows its current tunable params.
+Include a "parameter_recommendations" array with specific, evidence-based tuning suggestions:
+- **Confidence levels**: `high` = override the param directly, `medium` = blend 70% toward your target,
+  `low` = bias the random mutation direction toward your target (still random magnitude).
+- Only recommend params you have evidence-based opinions on. Omit params you're unsure about.
+- Focus on underperformers and models with clear parameter issues. Leave top performers alone.
+- You can tune `stop_loss_pct` and `take_profit_pct` on ANY model (these control automatic exits).
+- Use exact model names from the data. Only recommend params that appear in `all_parameters`.
+- If no parameter changes are warranted, return an empty array.
+
 OPEN QUESTIONS — include an "open_questions" array in your response with your assessment of each:
 1. "COLLAB model" — We are considering adding a collaborative model that is synthesized from the
    top performers between sessions (not a real-time voting ensemble). It would inherit the best
    parameters from winning strategies. Is this a good idea? What are the risks (overfitting,
    reduced diversity, regime sensitivity)? How would you structure it?
+2. "Adaptation warm-up period" — The operator has noticed that models seem to perform better later
+   in the session after adapt() has had time to tune parameters. If this is real (not random), should
+   we change our capital deployment strategy? E.g., start with smaller position sizes (say 50%) for
+   the first 30-60 minutes while adaptation calibrates, then ramp up to full allocation. Analyze the
+   intraday performance curve (early vs late trades) and the performance_snapshots timing to determine
+   if this pattern exists in the data. If it does, recommend a specific ramp-up schedule.
 
 ## Strategy Generation
 
@@ -1180,6 +1225,28 @@ def _render_markdown(review: dict[str, Any]) -> str:
                 lines.append(f"- {req}")
         lines.append("")
 
+    # Parameter recommendations
+    param_recs = review.get("parameter_recommendations", [])
+    if param_recs:
+        lines.append("## Parameter Recommendations")
+        lines.append("")
+        for entry in param_recs:
+            if not isinstance(entry, dict):
+                continue
+            model_name = entry.get("model_name", "?")
+            lines.append(f"### {model_name}")
+            recs = entry.get("recommendations", {})
+            if isinstance(recs, dict):
+                for param, spec in recs.items():
+                    if isinstance(spec, dict):
+                        conf = spec.get("confidence", "?")
+                        val = spec.get("value", "?")
+                        rationale = spec.get("rationale", "")
+                        lines.append(f"- **{param}** = {val} [{conf}] — {rationale}")
+                    else:
+                        lines.append(f"- **{param}**: {spec}")
+            lines.append("")
+
     return "\n".join(lines)
 
 
@@ -1220,7 +1287,7 @@ def run_cfa_review(
     client = anthropic.Anthropic(api_key=api_key, timeout=timeout_sec)
     response = client.messages.create(
         model=model_id,
-        max_tokens=8192,
+        max_tokens=16384,
         messages=[{"role": "user", "content": prompt}],
     )
     raw_text = response.content[0].text.strip()
@@ -1256,9 +1323,9 @@ def run_cfa_review(
 
 def _parse_review_json(text: str) -> dict | None:
     """Extract and parse JSON from LLM response text."""
-    # Try direct parse first
+    # Try direct parse first (strict=False to allow control chars in strings)
     try:
-        return json.loads(text)
+        return json.loads(text, strict=False)
     except json.JSONDecodeError:
         pass
 
@@ -1268,7 +1335,7 @@ def _parse_review_json(text: str) -> dict | None:
             start = text.index(marker) + len(marker)
             end = text.index("```", start)
             try:
-                return json.loads(text[start:end].strip())
+                return json.loads(text[start:end].strip(), strict=False)
             except (json.JSONDecodeError, ValueError):
                 pass
 
@@ -1277,11 +1344,74 @@ def _parse_review_json(text: str) -> dict | None:
     last_brace = text.rfind("}")
     if first_brace != -1 and last_brace > first_brace:
         try:
-            return json.loads(text[first_brace:last_brace + 1])
+            return json.loads(text[first_brace:last_brace + 1], strict=False)
         except json.JSONDecodeError:
             pass
 
     return None
+
+
+VALID_CONFIDENCE_LEVELS = {"high", "medium", "low"}
+
+
+def extract_parameter_recommendations(
+    review: dict[str, Any],
+    valid_model_names: set[str] | None = None,
+) -> dict[str, dict]:
+    """Extract and validate parameter recommendations from a CFA review.
+
+    Returns:
+        Dict mapping model_name -> {param_name: {"value": num, "confidence": str, "rationale": str}}
+        Invalid entries are silently dropped.
+    """
+    recs = review.get("parameter_recommendations", [])
+    if not isinstance(recs, list):
+        return {}
+
+    result: dict[str, dict] = {}
+    for entry in recs:
+        if not isinstance(entry, dict):
+            continue
+        model_name = entry.get("model_name")
+        if not isinstance(model_name, str) or not model_name:
+            continue
+        if valid_model_names and model_name not in valid_model_names:
+            logger.debug(f"CFA param rec: unknown model '{model_name}', skipping")
+            continue
+
+        recommendations = entry.get("recommendations", {})
+        if not isinstance(recommendations, dict):
+            continue
+
+        valid_recs = {}
+        for param, spec in recommendations.items():
+            if not isinstance(param, str) or not isinstance(spec, dict):
+                continue
+            value = spec.get("value")
+            confidence = spec.get("confidence", "").lower()
+            if not isinstance(value, (int, float)):
+                # Try to parse string numbers
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    continue
+            if confidence not in VALID_CONFIDENCE_LEVELS:
+                continue
+            valid_recs[param] = {
+                "value": value,
+                "confidence": confidence,
+                "rationale": str(spec.get("rationale", "")),
+            }
+
+        if valid_recs:
+            result[model_name] = valid_recs
+
+    if result:
+        logger.info(
+            f"CFA parameter recommendations extracted for {len(result)} models: "
+            + ", ".join(result.keys())
+        )
+    return result
 
 
 def _save_to_db(

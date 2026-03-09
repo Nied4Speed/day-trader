@@ -54,6 +54,7 @@ class PerformanceTracker:
         self._metrics: dict[int, ModelMetrics] = {}
         self._session_number: int = 1
         self._session_date: Optional[str] = None
+        self._session_start_utc: Optional[datetime] = None
 
     def set_session_number(self, session_number: int) -> None:
         """Set which session we're tracking (1 or 2)."""
@@ -66,6 +67,7 @@ class PerformanceTracker:
     def initialize_models(self, models: list[TradingModel]) -> None:
         """Set up tracking for a list of models at session start."""
         self._metrics.clear()
+        self._session_start_utc = datetime.utcnow()
         for model in models:
             self._metrics[model.id] = ModelMetrics(
                 model_id=model.id,
@@ -105,12 +107,14 @@ class PerformanceTracker:
                     price = last_prices.get(p.symbol, p.current_price)
                     unrealized += (price - p.avg_entry_price) * p.quantity
 
-            # Trade stats from filled orders (scoped to current session date)
+            # Trade stats from filled orders (scoped to current session start time)
             order_query = db.query(Order).filter(
                 Order.model_id == model_id,
                 Order.status == OrderStatus.FILLED,
             )
-            if self._session_date:
+            if self._session_start_utc:
+                order_query = order_query.filter(Order.filled_at >= self._session_start_utc)
+            elif self._session_date:
                 order_query = order_query.filter(Order.session_date == self._session_date)
             filled_orders = order_query.all()
             metrics.total_trades = len(filled_orders)
@@ -121,8 +125,11 @@ class PerformanceTracker:
             sell_orders = [o for o in filled_orders if o.side.value == "sell"]
             realized = sum((o.realized_pnl or 0.0) for o in sell_orders)
 
-            # Compute equity (capital + unrealized)
-            equity = model.current_capital + unrealized
+            # Compute equity (capital + position cost basis + unrealized)
+            position_cost = sum(
+                p.avg_entry_price * p.quantity for p in positions if p.quantity > 0
+            )
+            equity = model.current_capital + position_cost + unrealized
             metrics.equity = equity
             metrics.equity_curve.append(equity)
 

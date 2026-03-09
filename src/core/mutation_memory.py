@@ -63,7 +63,8 @@ class MutationMemory:
             return 0
         return (
             t.get("up_successes", 0) + t.get("up_failures", 0) +
-            t.get("down_successes", 0) + t.get("down_failures", 0)
+            t.get("down_successes", 0) + t.get("down_failures", 0) +
+            t.get("cfa_successes", 0) + t.get("cfa_failures", 0)
         )
 
     @staticmethod
@@ -117,7 +118,8 @@ class MutationMemory:
         for key, tallies in memory.items():
             if key.startswith("_") or not isinstance(tallies, dict):
                 continue
-            for field in ("up_successes", "up_failures", "down_successes", "down_failures"):
+            for field in ("up_successes", "up_failures", "down_successes", "down_failures",
+                         "cfa_successes", "cfa_failures"):
                 if field in tallies:
                     tallies[field] = round(tallies[field] * decay, 3)
 
@@ -127,10 +129,17 @@ class MutationMemory:
                 memory[param] = {
                     "up_successes": 0, "up_failures": 0,
                     "down_successes": 0, "down_failures": 0,
+                    "cfa_successes": 0, "cfa_failures": 0,
                 }
             tallies = memory[param]
 
-            if direction == "up":
+            # CFA-guided mutations: track separately for measuring CFA effectiveness
+            if direction in ("cfa_high", "cfa_medium", "cfa_low"):
+                if improved:
+                    tallies["cfa_successes"] = tallies.get("cfa_successes", 0) + 1
+                else:
+                    tallies["cfa_failures"] = tallies.get("cfa_failures", 0) + 1
+            elif direction == "up":
                 if improved:
                     tallies["up_successes"] = tallies.get("up_successes", 0) + 1
                 else:

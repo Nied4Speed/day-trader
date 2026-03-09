@@ -234,6 +234,13 @@ class Arena:
             )
             strategy.current_capital = model.current_capital
             strategy.initial_capital = model.initial_capital
+            # Apply stop_loss/take_profit from DB params (strategies may not
+            # read these in set_params, but they're tracked at the base class).
+            params = model.parameters or {}
+            if "stop_loss_pct" in params:
+                strategy.stop_loss_pct = max(0.5, min(10.0, float(params["stop_loss_pct"])))
+            if "take_profit_pct" in params:
+                strategy.take_profit_pct = max(0.5, min(15.0, float(params["take_profit_pct"])))
             self._models[model.id] = strategy
             self._model_records[model.id] = model
 

@@ -48,6 +48,7 @@ class ExecutionHandler:
         self.simulate = simulate  # True = fill at bar close, no Alpaca calls
         self._client: Optional[TradingClient] = None
         self._daily_pnl: dict[int, float] = {}  # model_id -> daily pnl
+        self._daily_loss_breached: set[int] = set()  # models that hit daily loss limit
         self._session_number: int = 1
         self._last_api_call: float = 0.0
         self._api_lock = threading.Lock()
@@ -215,6 +216,7 @@ class ExecutionHandler:
     def reset_daily_limits(self) -> None:
         """Reset daily P&L tracking at session start."""
         self._daily_pnl.clear()
+        self._daily_loss_breached.clear()
 
     def check_risk_limits(
         self,
@@ -231,6 +233,7 @@ class ExecutionHandler:
         daily_pnl = self._daily_pnl.get(model_id, 0.0)
         max_loss = current_capital * self.config.arena.max_daily_loss_pct
         if daily_pnl < -max_loss:
+            self._daily_loss_breached.add(model_id)
             raise RiskLimitExceeded(
                 f"Model {model_id} exceeded max daily loss: "
                 f"{daily_pnl:.2f} < -{max_loss:.2f}"
@@ -337,6 +340,16 @@ class ExecutionHandler:
         session_date: str,
     ) -> Optional[Order]:
         """Submit an order to Alpaca after risk checks."""
+        # Minimum quantity guard — Alpaca rejects qty <= 0 or ~1e-9.
+        # Catch it here to avoid noisy rejected order records.
+        if signal.quantity < 0.001:
+            return None
+
+        # Circuit breaker: once a model hits daily loss, silently drop new buys
+        # (sells still allowed for liquidation/stop-loss exits).
+        if signal.side == "buy" and model_id in self._daily_loss_breached:
+            return None
+
         # Wash trade cooldown check (before DB session to avoid unnecessary work)
         if self._check_wash_trade(model_id, signal.symbol):
             return None

@@ -800,13 +800,16 @@ async def model_trades(model_id: int, session_date: Optional[str] = None):
         )
 
         # Group orders by symbol, then pair buys with sells chronologically
+        # Use a separate dict to track remaining qty (never mutate ORM objects)
         from collections import defaultdict
         buys_by_symbol: dict[str, list] = defaultdict(list)
+        buy_remaining_qty: dict[int, float] = {}  # order.id -> remaining qty
         result = []
 
         for o in orders:
             if o.side == OrderSide.BUY:
                 buys_by_symbol[o.symbol].append(o)
+                buy_remaining_qty[o.id] = o.fill_quantity or o.quantity
             elif o.side == OrderSide.SELL:
                 qty_to_match = o.fill_quantity or o.quantity
                 sell_price = o.fill_price
@@ -815,7 +818,7 @@ async def model_trades(model_id: int, session_date: Optional[str] = None):
                 # Match against queued buys for this symbol (FIFO)
                 while qty_to_match > 0 and buys_by_symbol[o.symbol]:
                     buy = buys_by_symbol[o.symbol][0]
-                    buy_qty = buy.fill_quantity or buy.quantity
+                    buy_qty = buy_remaining_qty[buy.id]
                     matched = min(qty_to_match, buy_qty)
 
                     pnl = (sell_price - buy.fill_price) * matched - (
@@ -840,13 +843,12 @@ async def model_trades(model_id: int, session_date: Optional[str] = None):
                     if buy_remaining <= 0:
                         buys_by_symbol[o.symbol].pop(0)
                     else:
-                        # Partially matched - update remaining qty on the buy
-                        buy.fill_quantity = buy_remaining
+                        buy_remaining_qty[buy.id] = buy_remaining
 
         # Remaining unmatched buys are open positions
         for symbol, buys in buys_by_symbol.items():
             for buy in buys:
-                buy_qty = buy.fill_quantity or buy.quantity
+                buy_qty = buy_remaining_qty[buy.id]
                 # Get current price from Position table if available
                 pos = (
                     db.query(Position)
@@ -913,6 +915,18 @@ async def arena_start(req: ArenaStartRequest):
     except Exception as e:
         logger.exception("Failed to start arena")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/arena/incident")
+async def arena_incident(req: dict):
+    """Add an incident note to the running arena for inclusion in the CFA review."""
+    if _arena_instance is None:
+        raise HTTPException(status_code=404, detail="No arena instance")
+    note = req.get("note", "")
+    if not note:
+        raise HTTPException(status_code=400, detail="Missing 'note' field")
+    _arena_instance.add_incident_note(note)
+    return {"status": "added", "note": note}
 
 
 @app.post("/api/arena/stop")

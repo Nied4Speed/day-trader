@@ -56,9 +56,10 @@ class EvolutionEngine:
             logger.warning("No models to evolve")
             return {"error": "no_models"}
 
-        # Separate protected models (COLLAB) from competitive pool
-        protected = [m for m in leaderboard if m.strategy_type == "collab"]
-        competitive = [m for m in leaderboard if m.strategy_type != "collab"]
+        # Separate protected models (COLLAB, CFA-generated) from competitive pool
+        protected_types = {"collab", "cfa_generated"}
+        protected = [m for m in leaderboard if m.strategy_type in protected_types]
+        competitive = [m for m in leaderboard if m.strategy_type not in protected_types]
 
         if not competitive:
             logger.warning("No competitive models to evolve")

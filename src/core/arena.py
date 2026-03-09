@@ -19,7 +19,7 @@ from datetime import datetime, time, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from src.core.cfa_review import run_cfa_review
+from src.core.cfa_review import apply_cfa_strategy, run_cfa_review
 from src.core.config import Config
 from src.core.database import (
     DailyLedger,
@@ -83,6 +83,15 @@ class Arena:
         self._watch_list: dict[int, dict[str, dict]] = {}  # model_id -> {symbol -> entry}
         self._watch_subscribed: set[str] = set()  # symbols subscribed for watch quotes
         self._last_watch_dispatch: dict[tuple, float] = {}  # (model_id, symbol) -> last dispatch time
+        # Incident notes for CFA review — operational issues that affect data interpretation
+        self._incident_notes: list[str] = []
+        # Track stop-loss/take-profit fires to avoid re-triggering: set of (model_id, symbol)
+        self._stop_loss_fired: set[tuple[int, str]] = set()
+
+    def add_incident_note(self, note: str) -> None:
+        """Add an operational incident note that will be included in the CFA review."""
+        self._incident_notes.append(note)
+        logger.info(f"Incident note added: {note}")
         self._watch_stats: dict[str, int] = {"created": 0, "expired": 0, "converted": 0}
         # Quote aggregator for synthetic bars (created per session)
         self._quote_aggregator: Optional[QuoteAggregator] = None
@@ -528,6 +537,9 @@ class Arena:
         # Collect signals from all bars × all models in one thread call
         model_signals: list[ModelSignal] = []
         liquidation_signals: list[tuple[int, TradeSignal, float]] = []
+        # Track capital pre-deducted during signal collection so we can restore it
+        # after resolve() — only resolved orders should actually deduct capital.
+        pre_deducted: dict[int, float] = {}  # model_id -> total amount pre-deducted
 
         def _process_all():
             # One batch DB read for all models
@@ -558,10 +570,16 @@ class Arena:
                                     )
                                 )
                                 self._recent_signals.setdefault(model_id, []).append(signal)
-                                # Pre-deduct capital so next signal sees reduced balance
+                                # Temporarily pre-deduct capital so next signal sees
+                                # reduced balance (prevents over-commitment within a
+                                # single batch).  We restore ALL pre-deducted amounts
+                                # after resolve() and only permanently deduct for
+                                # orders that actually get submitted.
                                 if signal.side == "buy":
                                     est_price = self.execution._last_prices.get(signal.symbol, bar.close)
-                                    strategy.current_capital -= signal.quantity * est_price
+                                    deduct = signal.quantity * est_price
+                                    strategy.current_capital -= deduct
+                                    pre_deducted[model_id] = pre_deducted.get(model_id, 0.0) + deduct
                     except Exception:
                         logger.exception(f"Error processing bar for model {model_id}")
 
@@ -572,11 +590,57 @@ class Arena:
                     seen_symbols.add(bar.symbol)
                     self._batch_update_position_prices(bar.symbol, bar.close)
 
-            self._update_position_manager_state_cached(positioned_symbols)
+            # Check stop-loss / take-profit for all models holding positions
+            # Uses latest bar close prices as the check price.
+            latest_prices: dict[str, float] = {}
+            for bar in bars:
+                latest_prices[bar.symbol] = bar.close
+            for model_id, strategy in self._models.items():
+                for symbol, qty in list(strategy._positions.items()):
+                    if qty <= 0 or symbol not in latest_prices:
+                        continue
+                    # Skip if we already fired a stop/TP for this position
+                    sl_key = (model_id, symbol)
+                    if sl_key in self._stop_loss_fired:
+                        continue
+                    price = latest_prices[symbol]
+                    entry_price = strategy._entry_prices.get(symbol)
+                    if not entry_price or entry_price <= 0:
+                        continue
+                    pct_change = (price - entry_price) / entry_price * 100.0
+                    triggered = None
+                    if strategy.stop_loss_pct and pct_change <= -strategy.stop_loss_pct:
+                        triggered = "stop_loss"
+                    elif strategy.take_profit_pct and pct_change >= strategy.take_profit_pct:
+                        triggered = "take_profit"
+                    if triggered:
+                        signal = TradeSignal(symbol=symbol, side="sell", quantity=qty)
+                        liquidation_signals.append(
+                            (model_id, signal, strategy.current_capital)
+                        )
+                        self._stop_loss_fired.add(sl_key)
+                        logger.info(
+                            f"[{triggered.upper()}] model {model_id} {symbol}: "
+                            f"entry={entry_price:.2f} now={price:.2f} ({pct_change:+.2f}%) "
+                            f"-> selling {qty}"
+                        )
+
+            # NOTE: position manager state update moved to AFTER capital
+            # restoration so it sees true capital, not pre-deducted amounts.
 
         logger.info("[BATCH-DBG] starting _process_all thread...")
         await asyncio.to_thread(_process_all)
         logger.info(f"[BATCH-DBG] _process_all done: {len(model_signals)} signals")
+
+        # Restore ALL temporarily pre-deducted capital.  Only resolved orders
+        # that actually get submitted will have capital permanently deducted below.
+        for model_id, amount in pre_deducted.items():
+            self._models[model_id].current_capital += amount
+
+        # Update position manager with true capital (after restoration)
+        self._update_position_manager_state_cached(
+            self._cached_positioned_symbols
+        )
 
         # Resolve conflicting signals
         resolved_orders = self.position_manager.resolve(model_signals)
@@ -1094,6 +1158,10 @@ class Arena:
                     self._refresh_model_state, model_id, self._models[model_id]
                 )
 
+                # Clear stop-loss fired flag on buy (new position can trigger fresh)
+                # or on sell (position gone, flag no longer needed)
+                self._stop_loss_fired.discard((model_id, symbol))
+
                 # Track fill for intra-session adaptation
                 entry_price = self._models[model_id]._entry_prices.get(symbol, price)
                 pnl = (price - entry_price) * qty if side == "sell" else 0.0
@@ -1499,6 +1567,7 @@ class Arena:
 
         self._set_status("reviewing", "Running CFA review")
         try:
+            incident_notes = "\n".join(f"- {n}" for n in self._incident_notes) if self._incident_notes else ""
             review = await asyncio.to_thread(
                 run_cfa_review,
                 self.config.db_path,
@@ -1506,9 +1575,24 @@ class Arena:
                 self.config.arena.cfa_review_model,
                 self.config.arena.cfa_review_timeout_sec,
                 self.config.arena.cfa_review_lookback_days,
+                incident_notes,
             )
             if review:
                 self._print_cfa_review(review)
+                # Apply CFA-generated strategy if present
+                strategy_code = review.get("generated_strategy")
+                if strategy_code:
+                    self._set_status("reviewing", "Applying CFA-generated strategy")
+                    success = await asyncio.to_thread(
+                        apply_cfa_strategy,
+                        strategy_code,
+                        self.config.db_path,
+                        self.config.arena.initial_capital,
+                    )
+                    if success:
+                        logger.info("CFA-generated strategy applied — will be active next session")
+                    else:
+                        logger.warning("CFA-generated strategy failed validation — skipped")
             else:
                 logger.warning("CFA Review returned no result")
         except Exception:
@@ -1768,6 +1852,17 @@ class Arena:
         self._session_start_params: dict[int, dict] = {
             mid: {**strategy.get_params()} for mid, strategy in self._models.items()
         }
+
+        # Reconcile DB positions with Alpaca before trading
+        if not self.simulate:
+            recon = await asyncio.to_thread(
+                self.execution.reconcile_positions_with_alpaca
+            )
+            if recon.get("zeroed") or recon.get("adjusted"):
+                # Refresh model state after reconciliation fixed positions/capital
+                for model_id, strategy in self._models.items():
+                    self._refresh_model_state(model_id, strategy)
+                models = list(self._model_records.values())
 
         # Reset position manager and regime detector for this session
         total_capital = sum(m.current_capital for m in models)
@@ -2088,6 +2183,13 @@ class Arena:
             loop.set_default_executor(ThreadPoolExecutor(max_workers=32))
             models = self._load_or_create_models()
             self._instantiate_strategies(models)
+
+            # Reconcile DB positions with Alpaca before restoring state
+            recon = await asyncio.to_thread(
+                self.execution.reconcile_positions_with_alpaca
+            )
+            if recon.get("zeroed") or recon.get("adjusted"):
+                logger.info("Resume: reconciliation cleaned up stale positions")
 
             # Restore positions + capital from DB (positions survive across restarts)
             for model_id, strategy in self._models.items():

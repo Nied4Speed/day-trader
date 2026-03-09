@@ -676,6 +676,125 @@ class ExecutionHandler:
             logger.exception("Failed to liquidate via Alpaca API")
             return 0
 
+    def reconcile_positions_with_alpaca(self) -> dict:
+        """Sync DB positions with actual Alpaca positions.
+
+        Queries Alpaca for real positions, then:
+        - Zeros out DB positions that don't exist on Alpaca (phantom positions)
+        - Updates quantity for mismatches
+        - Adjusts model capital for cleaned-up phantom positions
+
+        Returns summary dict of changes made.
+        """
+        if self.simulate:
+            return {"skipped": True, "reason": "simulate mode"}
+
+        self._throttle()
+        try:
+            alpaca_positions = self.client.get_all_positions()
+        except Exception:
+            logger.exception("Failed to fetch Alpaca positions for reconciliation")
+            return {"error": "failed to fetch Alpaca positions"}
+
+        # Build lookup: symbol -> {qty, avg_entry_price, current_price}
+        alpaca_by_symbol: dict[str, dict] = {}
+        for ap in alpaca_positions:
+            alpaca_by_symbol[ap.symbol] = {
+                "qty": float(ap.qty),
+                "avg_entry_price": float(ap.avg_entry_price),
+                "current_price": float(ap.current_price),
+            }
+
+        db = get_session(self.config.db_path)
+        changes = {"zeroed": [], "adjusted": [], "alpaca_positions": len(alpaca_positions)}
+        try:
+            # Get all DB positions with quantity > 0
+            db_positions = db.query(Position).filter(Position.quantity > 0).all()
+
+            for pos in db_positions:
+                alpaca_pos = alpaca_by_symbol.get(pos.symbol)
+
+                if alpaca_pos is None:
+                    # Phantom position: exists in DB but not on Alpaca
+                    logger.warning(
+                        f"Reconcile: zeroing phantom position model {pos.model_id} "
+                        f"{pos.symbol} qty={pos.quantity:.4f} "
+                        f"(avg_entry={pos.avg_entry_price:.2f})"
+                    )
+                    # Credit back the cost basis to model capital
+                    model = db.query(TradingModel).get(pos.model_id)
+                    if model:
+                        cost_basis = pos.avg_entry_price * pos.quantity
+                        model.current_capital += cost_basis
+                        logger.info(
+                            f"Reconcile: credited ${cost_basis:.2f} back to "
+                            f"model {pos.model_id} capital"
+                        )
+                    pos.quantity = 0
+                    pos.avg_entry_price = 0.0
+                    pos.unrealized_pnl = 0.0
+                    pos.current_price = 0.0
+                    pos.updated_at = datetime.utcnow()
+                    changes["zeroed"].append({
+                        "model_id": pos.model_id,
+                        "symbol": pos.symbol,
+                    })
+
+                elif abs(alpaca_pos["qty"] - pos.quantity) > 0.001:
+                    # Quantity mismatch
+                    old_qty = pos.quantity
+                    pos.quantity = alpaca_pos["qty"]
+                    pos.avg_entry_price = alpaca_pos["avg_entry_price"]
+                    pos.current_price = alpaca_pos["current_price"]
+                    pos.unrealized_pnl = (
+                        (alpaca_pos["current_price"] - alpaca_pos["avg_entry_price"])
+                        * alpaca_pos["qty"]
+                    )
+                    pos.updated_at = datetime.utcnow()
+
+                    # Adjust capital for the quantity difference
+                    qty_diff = old_qty - alpaca_pos["qty"]
+                    if qty_diff > 0:
+                        model = db.query(TradingModel).get(pos.model_id)
+                        if model:
+                            credit = qty_diff * alpaca_pos["avg_entry_price"]
+                            model.current_capital += credit
+                            logger.info(
+                                f"Reconcile: adjusted model {pos.model_id} capital "
+                                f"+${credit:.2f} for {pos.symbol} qty diff"
+                            )
+
+                    logger.warning(
+                        f"Reconcile: adjusted position model {pos.model_id} "
+                        f"{pos.symbol} qty {old_qty:.4f} -> {alpaca_pos['qty']:.4f}"
+                    )
+                    changes["adjusted"].append({
+                        "model_id": pos.model_id,
+                        "symbol": pos.symbol,
+                        "old_qty": old_qty,
+                        "new_qty": alpaca_pos["qty"],
+                    })
+
+            db.commit()
+
+            total_changes = len(changes["zeroed"]) + len(changes["adjusted"])
+            if total_changes:
+                logger.info(
+                    f"Reconciliation complete: zeroed {len(changes['zeroed'])} phantom positions, "
+                    f"adjusted {len(changes['adjusted'])} mismatches"
+                )
+            else:
+                logger.info("Reconciliation complete: DB positions match Alpaca")
+
+        except Exception:
+            db.rollback()
+            logger.exception("Position reconciliation failed")
+            changes["error"] = "reconciliation failed"
+        finally:
+            db.close()
+
+        return changes
+
     def update_positions_price(self, model_id: int, symbol: str, price: float) -> None:
         """Update current price and unrealized P&L for a position."""
         db = get_session(self.config.db_path)

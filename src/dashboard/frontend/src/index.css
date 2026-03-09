@@ -295,6 +295,22 @@ body {
   overflow: hidden;
 }
 
+.trades-toggle {
+  display: block;
+  width: 100%;
+  padding: 0.4rem 0.75rem;
+  background: transparent;
+  border: none;
+  border-top: 1px solid var(--border);
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+}
+.trades-toggle:hover { color: var(--text-primary); }
+
 .activity-toggle {
   display: block;
   width: 100%;

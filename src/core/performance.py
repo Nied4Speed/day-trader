@@ -104,17 +104,6 @@ class PerformanceTracker:
                 if p.quantity > 0 and p.avg_entry_price > 0:
                     price = last_prices.get(p.symbol, p.current_price)
                     unrealized += (price - p.avg_entry_price) * p.quantity
-            realized = sum(p.realized_pnl for p in positions)
-
-            # Compute equity (capital + unrealized)
-            equity = model.current_capital + unrealized
-            metrics.equity = equity
-            metrics.equity_curve.append(equity)
-
-            # Total P&L
-            metrics.total_pnl = realized + unrealized
-            if model.initial_capital > 0:
-                metrics.return_pct = metrics.total_pnl / model.initial_capital * 100
 
             # Trade stats from filled orders (scoped to current session date)
             order_query = db.query(Order).filter(
@@ -126,8 +115,23 @@ class PerformanceTracker:
             filled_orders = order_query.all()
             metrics.total_trades = len(filled_orders)
 
-            # Compute per-trade returns from individual sell order P&L
+            # Realized P&L from filled sell orders (not from positions table,
+            # which can be stale/phantom). Each sell order has realized_pnl
+            # computed at fill time from actual Alpaca execution prices.
             sell_orders = [o for o in filled_orders if o.side.value == "sell"]
+            realized = sum((o.realized_pnl or 0.0) for o in sell_orders)
+
+            # Compute equity (capital + unrealized)
+            equity = model.current_capital + unrealized
+            metrics.equity = equity
+            metrics.equity_curve.append(equity)
+
+            # Total P&L
+            metrics.total_pnl = realized + unrealized
+            if model.initial_capital > 0:
+                metrics.return_pct = metrics.total_pnl / model.initial_capital * 100
+
+            # Compute per-trade returns from individual sell order P&L
             if sell_orders:
                 metrics.trade_returns = [
                     (o.realized_pnl or 0.0) / model.initial_capital

@@ -1,5 +1,5 @@
 import { useState, useMemo } from 'react'
-import { useWebSocket, Model, Trade } from './hooks'
+import { useWebSocket, useModelTrades, Model, Trade } from './hooks'
 
 const STRATEGY_DESCRIPTIONS: Record<string, string> = {
   ma_crossover: "Moving Average Crossover. Buys when a fast moving average (e.g. 10-bar) crosses above a slow one (e.g. 30-bar), sells on cross below. Classic trend-following approach. Each instance evolves its own fast/slow periods and allocation size through self-improvement.",
@@ -173,14 +173,27 @@ export default function App() {
   )
 }
 
+const TODAY = new Date().toISOString().slice(0, 10)
+
 function ModelCard({ model: m, allModels }: { model: Model; allModels: Model[] }) {
   const [showDesc, setShowDesc] = useState(false)
+  const [showTrades, setShowTrades] = useState(false)
   const perf = m.performance
   const pnl = perf?.total_pnl ?? 0
   const returnPct = perf?.return_pct ?? 0
   const totalUnrealized = m.positions.reduce((s, p) => s + p.unrealized_pnl, 0)
   const equity = m.current_capital + totalUnrealized
   const desc = getModelDescription(m, allModels)
+  const hasTrades = (perf?.total_trades ?? 0) > 0
+  const { trades: closedTrades, loading: tradesLoading } = useModelTrades(
+    showTrades ? m.id : null, showTrades ? TODAY : null
+  )
+  const sortedTrades = useMemo(() =>
+    closedTrades
+      .filter(t => t.status === 'closed')
+      .sort((a, b) => (b.sell_time ?? '').localeCompare(a.sell_time ?? '')),
+    [closedTrades]
+  )
 
   return (
     <div className={`model-card ${cls(pnl)}-border`}>
@@ -215,7 +228,7 @@ function ModelCard({ model: m, allModels }: { model: Model; allModels: Model[] }
         </div>
       </div>
 
-      {m.positions.length > 0 ? (
+      {m.positions.length > 0 && (
         <table className="positions-table">
           <thead>
             <tr>
@@ -238,8 +251,47 @@ function ModelCard({ model: m, allModels }: { model: Model; allModels: Model[] }
             ))}
           </tbody>
         </table>
-      ) : (
+      )}
+
+      {!m.positions.length && !showTrades && (
         <div className="no-positions">No open positions</div>
+      )}
+
+      {hasTrades && (
+        <button className="trades-toggle" onClick={() => setShowTrades(!showTrades)}>
+          {showTrades ? 'Hide' : 'Show'} Closed Trades {showTrades ? '\u25B2' : '\u25BC'}
+        </button>
+      )}
+
+      {showTrades && (
+        tradesLoading ? (
+          <div className="no-positions">Loading trades...</div>
+        ) : sortedTrades.length > 0 ? (
+          <table className="positions-table">
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Qty</th>
+                <th>Buy</th>
+                <th>Sell</th>
+                <th>P&L</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sortedTrades.map((t, i) => (
+                <tr key={`${t.symbol}-${t.buy_time}-${i}`} className={cls(t.pnl)}>
+                  <td className="sym">{t.symbol}</td>
+                  <td>{t.quantity.toFixed(2)}</td>
+                  <td>{formatMoney(t.buy_price)}</td>
+                  <td>{formatMoney(t.sell_price!)}</td>
+                  <td className={cls(t.pnl)}>{formatMoney(t.pnl)} ({t.pnl_pct >= 0 ? '+' : ''}{t.pnl_pct.toFixed(1)}%)</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <div className="no-positions">No closed trades yet</div>
+        )
       )}
     </div>
   )

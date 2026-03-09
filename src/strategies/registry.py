@@ -31,6 +31,13 @@ STRATEGY_REGISTRY: dict[str, type[Strategy]] = {
     "collab": CollabStrategy,
 }
 
+# Dynamically load CFA-generated strategy if it exists on disk
+try:
+    from src.strategies.cfa_generated import CfaGeneratedStrategy
+    STRATEGY_REGISTRY["cfa_generated"] = CfaGeneratedStrategy
+except (ImportError, SyntaxError, Exception):
+    pass  # CFA hasn't generated one yet, or it has errors — skip silently
+
 
 def create_strategy(
     strategy_type: str,

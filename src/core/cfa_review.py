@@ -715,7 +715,7 @@ def _build_cfa_model_section(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _build_review_prompt(data: dict[str, Any]) -> str:
+def _build_review_prompt(data: dict[str, Any], incident_notes: str = "") -> str:
     """Format gathered data into a structured LLM prompt."""
     data_json = json.dumps(data, indent=2, default=str)
 
@@ -1042,7 +1042,15 @@ class RSIReversionStrategy(Strategy):
 Include a `"generated_strategy"` key in your JSON response. Its value must be a STRING containing
 the complete, valid Python source code for the file. Use \\n for newlines within the string.
 The file should be self-contained and ready to write to `src/strategies/cfa_generated.py`.
-"""
+{f'''
+## Incident Notes
+
+The following operational incidents occurred during today's session. Factor these into your
+analysis, particularly in the risk_management and execution_quality sections. Note which data
+may be affected and adjust your assessment accordingly.
+
+{incident_notes}
+''' if incident_notes else ''}"""
 
 
 def _render_markdown(review: dict[str, Any]) -> str:
@@ -1181,6 +1189,7 @@ def run_cfa_review(
     model_id: str = "claude-opus-4-20250514",
     timeout_sec: int = 120,
     lookback_days: int = 10,
+    incident_notes: str = "",
 ) -> dict[str, Any] | None:
     """Run the full CFA review pipeline. Returns parsed review dict or None on failure."""
     try:
@@ -1204,7 +1213,7 @@ def run_cfa_review(
         return None
 
     # 2. Build prompt
-    prompt = _build_review_prompt(data)
+    prompt = _build_review_prompt(data, incident_notes=incident_notes)
 
     # 3. Call LLM
     logger.info(f"CFA Review: calling {model_id}...")

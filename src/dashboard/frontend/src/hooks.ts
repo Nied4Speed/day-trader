@@ -4,6 +4,7 @@ export interface Model {
   id: number; name: string; strategy_type: string; generation: number;
   rank: number; parent_ids: number[] | null; genetic_operation: string | null;
   initial_capital: number; current_capital: number;
+  capital_deployed?: number; deployment_pct?: number;
   performance: {
     equity: number; total_pnl: number; return_pct: number;
     sharpe_ratio: number; max_drawdown: number; win_rate: number;
@@ -315,6 +316,7 @@ export interface ModelTrade {
   pnl: number
   pnl_pct: number
   status: 'closed' | 'open'
+  reason?: string
 }
 
 export function useModelTrades(modelId: number | null, sessionDate: string | null) {
@@ -332,6 +334,75 @@ export function useModelTrades(modelId: number | null, sessionDate: string | nul
   }, [modelId, sessionDate])
 
   return { trades, loading }
+}
+
+// --- History View types & hooks ---
+
+export interface HistoryModel {
+  id: number; rank: number; name: string; strategy_type: string;
+  start_capital: number; end_capital: number; return_pct: number;
+  realized_pnl: number; trade_count: number; winning_trades: number; win_rate: number;
+}
+
+export interface HistoryTrade {
+  model_name: string; symbol: string; side: string;
+  quantity: number; fill_price: number; realized_pnl: number | null;
+  filled_at: string | null;
+}
+
+export interface HistorySession {
+  session_number: number;
+  started_at: string | null; ended_at: string | null;
+  total_bars: number; total_trades: number;
+}
+
+export interface DailyHistoryData {
+  date: string;
+  sessions: HistorySession[];
+  models: HistoryModel[];
+  portfolio: {
+    total_pnl: number; return_pct: number; total_trades: number;
+    win_rate: number; initial_capital: number; end_capital: number;
+    alpaca_pnl: number | null;
+    unattributed_pnl: number | null;
+  };
+  trades: HistoryTrade[];
+  equity_curve: { time: string; value: number }[];
+  cfa_grade: string | null;
+  cfa_summary: string | null;
+}
+
+export function useHistoryDates() {
+  const [dates, setDates] = useState<string[]>([])
+  const [loading, setLoading] = useState(false)
+
+  useEffect(() => {
+    setLoading(true)
+    fetch('/api/history/dates')
+      .then(r => r.json())
+      .then(data => { if (Array.isArray(data)) setDates(data) })
+      .catch(() => setDates([]))
+      .finally(() => setLoading(false))
+  }, [])
+
+  return { dates, loading }
+}
+
+export function useDailyHistory(date: string | null) {
+  const [data, setData] = useState<DailyHistoryData | null>(null)
+  const [loading, setLoading] = useState(false)
+
+  useEffect(() => {
+    if (!date) { setData(null); return }
+    setLoading(true)
+    fetch(`/api/history/${date}`)
+      .then(r => r.json())
+      .then(d => setData(d as DailyHistoryData))
+      .catch(() => setData(null))
+      .finally(() => setLoading(false))
+  }, [date])
+
+  return { data, loading }
 }
 
 export function useHistoricalData(sessionDate: string | null) {

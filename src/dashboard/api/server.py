@@ -26,6 +26,7 @@ from src.core.cfa_review import run_cfa_review
 from src.core.database import (
     Bar,
     CfaReview,
+    DailyLedger,
     GenerationRecord,
     ModelStatus,
     ModelSummary,
@@ -219,6 +220,8 @@ def _get_live_model_data() -> list[dict]:
         total_pnl = (capital + position_cost) - initial  # realized only
         return_pct = ((equity - initial) / initial) * 100 if initial > 0 else 0
 
+        deployment_pct = (position_cost / initial) * 100 if initial > 0 else 0
+
         models_data.append({
             "id": model_id,
             "name": record.name,
@@ -228,6 +231,8 @@ def _get_live_model_data() -> list[dict]:
             "genetic_operation": record.genetic_operation,
             "initial_capital": initial,
             "current_capital": round(capital, 2),
+            "capital_deployed": round(position_cost, 2),
+            "deployment_pct": round(deployment_pct, 1),
             "performance": {
                 "equity": round(equity, 2),
                 "total_pnl": round(total_pnl, 2),
@@ -376,6 +381,11 @@ def get_dashboard_data(session_date: str | None = None) -> dict:
                 .all()
             )
 
+            pos_cost = sum(
+                p.avg_entry_price * p.quantity for p in positions if p.quantity > 0.001
+            )
+            dep_pct = (pos_cost / model.initial_capital) * 100 if model.initial_capital > 0 else 0
+
             model_data.append({
                 "id": model.id,
                 "name": model.name,
@@ -385,6 +395,8 @@ def get_dashboard_data(session_date: str | None = None) -> dict:
                 "genetic_operation": model.genetic_operation,
                 "initial_capital": model.initial_capital,
                 "current_capital": model.current_capital,
+                "capital_deployed": round(pos_cost, 2),
+                "deployment_pct": round(dep_pct, 1),
                 "performance": {
                     "equity": snapshot.equity if snapshot else model.current_capital,
                     "total_pnl": snapshot.total_pnl if snapshot else 0,
@@ -844,6 +856,7 @@ async def model_trades(model_id: int, session_date: Optional[str] = None):
                         "pnl": round(pnl, 4),
                         "pnl_pct": round(pnl_pct, 4),
                         "status": "closed",
+                        "reason": o.signal_reason or "model_decision",
                     })
 
                     qty_to_match -= matched
@@ -884,10 +897,260 @@ async def model_trades(model_id: int, session_date: Optional[str] = None):
         db.close()
 
 
+@app.get("/api/history/dates")
+async def history_dates():
+    """Get distinct dates from DailyLedger, descending (for history date picker)."""
+    db = get_dashboard_session(DB_PATH)
+    try:
+        dates = (
+            db.query(DailyLedger.session_date)
+            .distinct()
+            .order_by(DailyLedger.session_date.desc())
+            .all()
+        )
+        return [d[0] for d in dates]
+    finally:
+        db.close()
+
+
+@app.get("/api/history/{session_date}")
+async def daily_history(session_date: str):
+    """Full daily summary: sessions, model performance, trades, CFA review."""
+    db = get_dashboard_session(DB_PATH)
+    try:
+        from sqlalchemy import func, case
+
+        # Sessions
+        sessions = (
+            db.query(SessionRecord)
+            .filter(SessionRecord.session_date == session_date)
+            .order_by(SessionRecord.session_number.asc())
+            .all()
+        )
+        session_data = [
+            {
+                "session_number": s.session_number,
+                "started_at": s.started_at.isoformat() if s.started_at else None,
+                "ended_at": s.ended_at.isoformat() if s.ended_at else None,
+                "total_bars": s.total_bars,
+                "total_trades": s.total_trades,
+            }
+            for s in sessions
+        ]
+
+        # Model performance from DailyLedger + Order aggregates
+        ledger_rows = (
+            db.query(DailyLedger)
+            .filter(DailyLedger.session_date == session_date)
+            .all()
+        )
+
+        models_data = []
+        portfolio_pnl = 0.0
+        portfolio_trades = 0
+        portfolio_wins = 0
+        portfolio_initial = 0.0
+        portfolio_end = 0.0
+
+        for row in ledger_rows:
+            model = db.query(TradingModel).get(row.model_id)
+            if not model:
+                continue
+
+            # Aggregate trades for this model on this date
+            trade_stats = (
+                db.query(
+                    func.count(Order.id).label("count"),
+                    func.sum(
+                        case(
+                            (Order.realized_pnl > 0, 1),
+                            else_=0,
+                        )
+                    ).label("wins"),
+                    func.sum(
+                        case(
+                            (Order.realized_pnl != None, Order.realized_pnl),  # noqa: E711
+                            else_=0,
+                        )
+                    ).label("realized"),
+                )
+                .filter(
+                    Order.model_id == row.model_id,
+                    Order.session_date == session_date,
+                    Order.status == OrderStatus.FILLED,
+                )
+                .first()
+            )
+
+            trade_count = trade_stats.count if trade_stats else 0
+            winning_trades = int(trade_stats.wins or 0) if trade_stats else 0
+            realized_pnl = float(trade_stats.realized or 0) if trade_stats else 0
+            win_rate = (winning_trades / trade_count * 100) if trade_count > 0 else 0.0
+            return_pct = row.daily_return_pct
+
+            models_data.append({
+                "id": row.model_id,
+                "name": model.name,
+                "strategy_type": model.strategy_type,
+                "start_capital": row.start_capital,
+                "end_capital": row.end_capital,
+                "return_pct": round(return_pct, 2),
+                "realized_pnl": round(realized_pnl, 2),
+                "trade_count": trade_count,
+                "winning_trades": winning_trades,
+                "win_rate": round(win_rate, 1),
+            })
+
+            portfolio_pnl += realized_pnl
+            portfolio_trades += trade_count
+            portfolio_wins += winning_trades
+            portfolio_initial += row.start_capital
+            portfolio_end += row.end_capital
+
+        # Sort by return % desc
+        models_data.sort(key=lambda m: m["return_pct"], reverse=True)
+        for i, m in enumerate(models_data, 1):
+            m["rank"] = i
+
+        # Portfolio totals
+        portfolio_return_pct = (
+            ((portfolio_end - portfolio_initial) / portfolio_initial) * 100
+            if portfolio_initial > 0 else 0
+        )
+        portfolio_win_rate = (
+            (portfolio_wins / portfolio_trades * 100)
+            if portfolio_trades > 0 else 0
+        )
+        # Sum alpaca_pnl from all sessions for this date
+        alpaca_pnl_total = None
+        for s in sessions:
+            if s.alpaca_pnl is not None:
+                alpaca_pnl_total = (alpaca_pnl_total or 0) + s.alpaca_pnl
+
+        # Unattributed = gap between Alpaca ground truth and model-tracked sum
+        unattributed_pnl = None
+        if alpaca_pnl_total is not None:
+            unattributed_pnl = round(alpaca_pnl_total - portfolio_pnl, 2)
+
+        portfolio = {
+            "total_pnl": round(portfolio_pnl, 2),
+            "return_pct": round(portfolio_return_pct, 2),
+            "total_trades": portfolio_trades,
+            "win_rate": round(portfolio_win_rate, 1),
+            "initial_capital": round(portfolio_initial, 2),
+            "end_capital": round(portfolio_end, 2),
+            "alpaca_pnl": round(alpaca_pnl_total, 2) if alpaca_pnl_total is not None else None,
+            "unattributed_pnl": unattributed_pnl,
+        }
+
+        # All filled trades for the day
+        orders = (
+            db.query(Order)
+            .filter(
+                Order.session_date == session_date,
+                Order.status == OrderStatus.FILLED,
+            )
+            .order_by(Order.filled_at.desc())
+            .all()
+        )
+
+        # Build model name lookup
+        model_names: dict[int, str] = {}
+        for m in models_data:
+            model_names[m["id"]] = m["name"]
+
+        trades = []
+        for o in orders:
+            if o.model_id not in model_names:
+                mdl = db.query(TradingModel).get(o.model_id)
+                model_names[o.model_id] = mdl.name if mdl else "Unknown"
+            trades.append({
+                "model_name": model_names[o.model_id],
+                "symbol": o.symbol,
+                "side": o.side.value,
+                "quantity": o.fill_quantity or o.quantity,
+                "fill_price": o.fill_price,
+                "realized_pnl": o.realized_pnl,
+                "filled_at": o.filled_at.isoformat() if o.filled_at else None,
+            })
+
+        # Equity curve from performance snapshots
+        # Only include timestamps where the full model roster reported
+        from collections import Counter
+        snap_rows = (
+            db.query(
+                PerformanceSnapshot.timestamp,
+                func.count(PerformanceSnapshot.model_id).label("n"),
+                func.sum(PerformanceSnapshot.equity).label("total"),
+            )
+            .filter(PerformanceSnapshot.session_date == session_date)
+            .group_by(PerformanceSnapshot.timestamp)
+            .order_by(PerformanceSnapshot.timestamp.asc())
+            .all()
+        )
+        # Use the most common model count as the expected full roster
+        if snap_rows:
+            counts = Counter(r.n for r in snap_rows)
+            expected_n = counts.most_common(1)[0][0]
+        else:
+            expected_n = 0
+        equity_curve = [
+            {
+                "time": s.timestamp.isoformat() + "Z",
+                "value": round(s.total, 2),
+            }
+            for s in snap_rows
+            if s.n == expected_n
+        ]
+
+        # CFA review
+        cfa = (
+            db.query(CfaReview)
+            .filter(CfaReview.session_date == session_date)
+            .first()
+        )
+        cfa_grade = None
+        cfa_summary = None
+        if cfa and cfa.review_json:
+            review = cfa.review_json
+            cfa_grade = review.get("grade") or review.get("overall_grade") or review.get("portfolio_grade")
+            cfa_summary = review.get("executive_summary") or review.get("summary")
+
+        return {
+            "date": session_date,
+            "sessions": session_data,
+            "models": models_data,
+            "portfolio": portfolio,
+            "trades": trades,
+            "equity_curve": equity_curve,
+            "cfa_grade": cfa_grade,
+            "cfa_summary": cfa_summary,
+        }
+    finally:
+        db.close()
+
+
 @app.get("/api/arena/state")
 async def arena_state():
     """Get current arena run state (idle/running/finished)."""
     return get_arena_run_state()
+
+
+@app.get("/api/health")
+async def health_check():
+    """Return latest health check results from the running arena."""
+    if _arena_instance is None:
+        return {
+            "status": "no_arena",
+            "message": "Arena is not running. Health checks run during active sessions.",
+        }
+    last = getattr(_arena_instance, "_last_health_check", {})
+    if not last:
+        return {
+            "status": "pending",
+            "message": "No health check has run yet this session.",
+        }
+    return last
 
 
 @app.post("/api/arena/start")

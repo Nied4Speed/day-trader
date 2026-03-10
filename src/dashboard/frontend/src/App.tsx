@@ -1,5 +1,6 @@
 import { useState, useMemo } from 'react'
-import { useWebSocket, useModelTrades, Model, Trade } from './hooks'
+import { useWebSocket, useModelTrades, useHistoryDates, useDailyHistory, Model, Trade, HistoryModel } from './hooks'
+import { EquityChart, EquityPoint } from './EquityChart'
 
 const STRATEGY_DESCRIPTIONS: Record<string, string> = {
   ma_crossover: "Moving Average Crossover. Buys when a fast moving average (e.g. 10-bar) crosses above a slow one (e.g. 30-bar), sells on cross below. Classic trend-following approach. Each instance evolves its own fast/slow periods and allocation size through self-improvement.",
@@ -21,6 +22,13 @@ function getModelDescription(model: Model, allModels: Model[]): string {
   return `Variant ${idx + 1} of ${siblings.length}. ${base}`
 }
 
+/** Convert ISO timestamp to UNIX seconds offset for local timezone display in LWC */
+function utcToLocalChartTime(iso: string): number {
+  const utcMs = new Date(iso.endsWith('Z') ? iso : iso + 'Z').getTime()
+  const offsetSec = new Date().getTimezoneOffset() * 60 // positive west of UTC
+  return Math.floor(utcMs / 1000) - offsetSec
+}
+
 function formatMoney(v: number) {
   const abs = Math.abs(v)
   const str = abs.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
@@ -34,6 +42,8 @@ export default function App() {
   const [starting, setStarting] = useState(false)
   const [formMins, setFormMins] = useState(390)
   const [activityOpen, setActivityOpen] = useState(true)
+  const [equityOpen, setEquityOpen] = useState(true)
+  const [activeTab, setActiveTab] = useState<'live' | 'history'>('live')
 
   const models = data?.models ?? []
   const trades = data?.trades ?? []
@@ -61,6 +71,30 @@ export default function App() {
     const initial = models.reduce((s, m) => s + m.initial_capital, 0)
     const returnPct = initial > 0 ? ((equity - initial) / initial) * 100 : 0
     return { equity, pnl, unrealized, posCount, returnPct }
+  }, [models])
+
+  // Aggregate equity curves across all models (only full-roster timestamps)
+  const portfolioEquity = useMemo<EquityPoint[]>(() => {
+    const byTime = new Map<string, { sum: number; count: number }>()
+    for (const m of models) {
+      for (const pt of m.equity_curve) {
+        const entry = byTime.get(pt.timestamp)
+        if (entry) { entry.sum += pt.equity; entry.count++ }
+        else byTime.set(pt.timestamp, { sum: pt.equity, count: 1 })
+      }
+    }
+    // Only include timestamps where all models reported
+    const counts = [...byTime.values()].map(v => v.count)
+    if (counts.length === 0) return []
+    const freq = new Map<number, number>()
+    for (const c of counts) freq.set(c, (freq.get(c) ?? 0) + 1)
+    let expectedN = 0, maxFreq = 0
+    for (const [n, f] of freq) { if (f > maxFreq) { maxFreq = f; expectedN = n } }
+
+    return [...byTime.entries()]
+      .filter(([, v]) => v.count === expectedN)
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([ts, v]) => ({ time: utcToLocalChartTime(ts) as any, value: v.sum }))
   }, [models])
 
   // Recent trades (last 20, newest first)
@@ -114,61 +148,83 @@ export default function App() {
         </div>
       </header>
 
-      {/* Status bar */}
-      {status && (
-        <div className="status-bar">
-          <span className={`phase ${status.phase}`}>{status.phase}</span>
-          <span className="detail">{status.detail}</span>
-          {status.total_bars && (
-            <span className="bars">Bar {status.bar}/{status.total_bars}</span>
+      {/* Tab bar */}
+      <div className="tab-bar">
+        <button className={`tab ${activeTab === 'live' ? 'active' : ''}`} onClick={() => setActiveTab('live')}>Live</button>
+        <button className={`tab ${activeTab === 'history' ? 'active' : ''}`} onClick={() => setActiveTab('history')}>History</button>
+      </div>
+
+      {activeTab === 'live' ? (
+        <>
+          {/* Status bar */}
+          {status && (
+            <div className="status-bar">
+              <span className={`phase ${status.phase}`}>{status.phase}</span>
+              <span className="detail">{status.detail}</span>
+              {status.total_bars && (
+                <span className="bars">Bar {status.bar}/{status.total_bars}</span>
+              )}
+            </div>
           )}
-        </div>
-      )}
 
-      {/* Portfolio summary */}
-      <div className="portfolio-strip">
-        <div className="portfolio-stat">
-          <span className="label">Portfolio</span>
-          <span className="value">{formatMoney(totals.equity)}</span>
-        </div>
-        <div className="portfolio-stat">
-          <span className="label">Realized P&L</span>
-          <span className={`value ${cls(totals.pnl)}`}>{formatMoney(totals.pnl)}</span>
-        </div>
-        <div className="portfolio-stat">
-          <span className="label">Unrealized</span>
-          <span className={`value ${cls(totals.unrealized)}`}>{formatMoney(totals.unrealized)}</span>
-        </div>
-        <div className="portfolio-stat">
-          <span className="label">Return</span>
-          <span className={`value ${cls(totals.returnPct)}`}>{formatPct(totals.returnPct)}</span>
-        </div>
-        <div className="portfolio-stat">
-          <span className="label">Open Positions</span>
-          <span className="value">{totals.posCount}</span>
-        </div>
-      </div>
-
-      {/* Model cards */}
-      <div className="model-grid">
-        {sorted.map(m => <ModelCard key={m.id} model={m} allModels={sorted} />)}
-        {sorted.length === 0 && (
-          <div className="empty">No models loaded</div>
-        )}
-      </div>
-
-      {/* Activity feed */}
-      <div className="activity-section">
-        <button className="activity-toggle" onClick={() => setActivityOpen(!activityOpen)}>
-          Recent Activity ({recentTrades.length}) {activityOpen ? '\u25B2' : '\u25BC'}
-        </button>
-        {activityOpen && (
-          <div className="activity-feed">
-            {recentTrades.map(t => <TradeRow key={t.id} trade={t} />)}
-            {recentTrades.length === 0 && <div className="empty">No trades yet</div>}
+          {/* Portfolio summary */}
+          <div className="portfolio-strip">
+            <div className="portfolio-stat">
+              <span className="label">Portfolio</span>
+              <span className="value">{formatMoney(totals.equity)}</span>
+            </div>
+            <div className="portfolio-stat">
+              <span className="label">Realized P&L</span>
+              <span className={`value ${cls(totals.pnl)}`}>{formatMoney(totals.pnl)}</span>
+            </div>
+            <div className="portfolio-stat">
+              <span className="label">Unrealized</span>
+              <span className={`value ${cls(totals.unrealized)}`}>{formatMoney(totals.unrealized)}</span>
+            </div>
+            <div className="portfolio-stat">
+              <span className="label">Return</span>
+              <span className={`value ${cls(totals.returnPct)}`}>{formatPct(totals.returnPct)}</span>
+            </div>
+            <div className="portfolio-stat">
+              <span className="label">Open Positions</span>
+              <span className="value">{totals.posCount}</span>
+            </div>
           </div>
-        )}
-      </div>
+
+          {/* Equity curve */}
+          {portfolioEquity.length > 1 && (
+            <div className="equity-chart-section">
+              <button className="equity-chart-toggle" onClick={() => setEquityOpen(!equityOpen)}>
+                Equity Curve {equityOpen ? '\u25B2' : '\u25BC'}
+              </button>
+              {equityOpen && <EquityChart data={portfolioEquity} />}
+            </div>
+          )}
+
+          {/* Model cards */}
+          <div className="model-grid">
+            {sorted.map(m => <ModelCard key={m.id} model={m} allModels={sorted} />)}
+            {sorted.length === 0 && (
+              <div className="empty">No models loaded</div>
+            )}
+          </div>
+
+          {/* Activity feed */}
+          <div className="activity-section">
+            <button className="activity-toggle" onClick={() => setActivityOpen(!activityOpen)}>
+              Recent Activity ({recentTrades.length}) {activityOpen ? '\u25B2' : '\u25BC'}
+            </button>
+            {activityOpen && (
+              <div className="activity-feed">
+                {recentTrades.map(t => <TradeRow key={t.id} trade={t} />)}
+                {recentTrades.length === 0 && <div className="empty">No trades yet</div>}
+              </div>
+            )}
+          </div>
+        </>
+      ) : (
+        <HistoryView />
+      )}
     </div>
   )
 }
@@ -219,6 +275,12 @@ function ModelCard({ model: m, allModels }: { model: Model; allModels: Model[] }
             <span className={`value ${cls(totalUnrealized)}`}>{formatMoney(totalUnrealized)}</span>
           </div>
         )}
+        <div className="stat-group">
+          <span className="label">Deployed</span>
+          <span className="value">
+            {formatMoney(m.capital_deployed ?? 0)} ({(m.deployment_pct ?? 0).toFixed(0)}%)
+          </span>
+        </div>
         <div className="stat-group">
           <span className="label">Trades</span>
           <span className="value">
@@ -275,6 +337,7 @@ function ModelCard({ model: m, allModels }: { model: Model; allModels: Model[] }
                 <th>Buy</th>
                 <th>Sell</th>
                 <th>P&L</th>
+                <th>Reason</th>
               </tr>
             </thead>
             <tbody>
@@ -285,6 +348,7 @@ function ModelCard({ model: m, allModels }: { model: Model; allModels: Model[] }
                   <td>{formatMoney(t.buy_price)}</td>
                   <td>{formatMoney(t.sell_price!)}</td>
                   <td className={cls(t.pnl)}>{formatMoney(t.pnl)} ({t.pnl_pct >= 0 ? '+' : ''}{t.pnl_pct.toFixed(1)}%)</td>
+                  <td className="reason-tag">{t.reason?.replace(/_/g, ' ') ?? ''}</td>
                 </tr>
               ))}
             </tbody>
@@ -294,6 +358,217 @@ function ModelCard({ model: m, allModels }: { model: Model; allModels: Model[] }
         )
       )}
     </div>
+  )
+}
+
+function HistoryView() {
+  const { dates, loading: datesLoading } = useHistoryDates()
+  const [selectedDate, setSelectedDate] = useState<string | null>(null)
+  const { data, loading } = useDailyHistory(selectedDate)
+  const [expandedModel, setExpandedModel] = useState<number | null>(null)
+  const [tradesOpen, setTradesOpen] = useState(false)
+  const [histEquityOpen, setHistEquityOpen] = useState(true)
+
+  // Auto-select most recent date
+  if (!selectedDate && dates.length > 0) setSelectedDate(dates[0])
+
+  const modelTrades = useMemo(() => {
+    if (!data || expandedModel == null) return []
+    const model = data.models.find(m => m.id === expandedModel)
+    if (!model) return []
+    return data.trades.filter(t => t.model_name === model.name)
+      .sort((a, b) => (b.filled_at ?? '').localeCompare(a.filled_at ?? ''))
+  }, [data, expandedModel])
+
+  const histEquityCurve = useMemo<EquityPoint[]>(() => {
+    if (!data?.equity_curve) return []
+    return data.equity_curve.map(pt => ({
+      time: utcToLocalChartTime(pt.time) as any,
+      value: pt.value,
+    }))
+  }, [data])
+
+  return (
+    <div className="history-view">
+      {/* Date picker */}
+      <div className="history-header">
+        <select
+          className="date-picker"
+          value={selectedDate ?? ''}
+          onChange={e => { setSelectedDate(e.target.value || null); setExpandedModel(null) }}
+          disabled={datesLoading}
+        >
+          {dates.length === 0 && <option value="">No history available</option>}
+          {dates.map(d => <option key={d} value={d}>{d}</option>)}
+        </select>
+        {loading && <span className="loading-label">Loading...</span>}
+      </div>
+
+      {data && (
+        <>
+          {/* CFA badge */}
+          {data.cfa_grade && (
+            <div className="cfa-section">
+              <span className={`cfa-badge grade-${data.cfa_grade.charAt(0).toLowerCase()}`}>
+                {data.cfa_grade}
+              </span>
+              {data.cfa_summary && <span className="cfa-summary">{data.cfa_summary}</span>}
+            </div>
+          )}
+
+          {/* Portfolio summary */}
+          <div className="portfolio-strip">
+            <div className="portfolio-stat">
+              <span className="label">{data.portfolio.alpaca_pnl != null ? 'P&L (Alpaca)' : 'Total P&L'}</span>
+              <span className={`value ${cls(data.portfolio.alpaca_pnl ?? data.portfolio.total_pnl)}`}>
+                {formatMoney(data.portfolio.alpaca_pnl ?? data.portfolio.total_pnl)}
+              </span>
+            </div>
+            {data.portfolio.alpaca_pnl != null && (
+              <>
+                <div className="portfolio-stat">
+                  <span className="label">Model Est.</span>
+                  <span className={`value ${cls(data.portfolio.total_pnl)}`}>{formatMoney(data.portfolio.total_pnl)}</span>
+                </div>
+                {data.portfolio.unattributed_pnl != null && data.portfolio.unattributed_pnl !== 0 && (
+                  <div className="portfolio-stat">
+                    <span className="label">Unattributed</span>
+                    <span className={`value ${cls(data.portfolio.unattributed_pnl)}`}>{formatMoney(data.portfolio.unattributed_pnl)}</span>
+                  </div>
+                )}
+              </>
+            )}
+            <div className="portfolio-stat">
+              <span className="label">Return</span>
+              <span className={`value ${cls(data.portfolio.return_pct)}`}>{formatPct(data.portfolio.return_pct)}</span>
+            </div>
+            <div className="portfolio-stat">
+              <span className="label">Trades</span>
+              <span className="value">{data.portfolio.total_trades}</span>
+            </div>
+            <div className="portfolio-stat">
+              <span className="label">Win Rate</span>
+              <span className="value">{data.portfolio.win_rate.toFixed(1)}%</span>
+            </div>
+          </div>
+
+          {/* Equity curve */}
+          {histEquityCurve.length > 1 && (
+            <div className="equity-chart-section">
+              <button className="equity-chart-toggle" onClick={() => setHistEquityOpen(!histEquityOpen)}>
+                Equity Curve {histEquityOpen ? '\u25B2' : '\u25BC'}
+              </button>
+              {histEquityOpen && <EquityChart data={histEquityCurve} />}
+            </div>
+          )}
+
+          {/* Model leaderboard */}
+          <div className="leaderboard-section">
+            <table className="leaderboard-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Name</th>
+                  <th>Type</th>
+                  <th>Return %</th>
+                  <th>P&L</th>
+                  <th>Trades</th>
+                  <th>Win Rate</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.models.map(m => (
+                  <LeaderboardRow
+                    key={m.id}
+                    model={m}
+                    expanded={expandedModel === m.id}
+                    trades={expandedModel === m.id ? modelTrades : []}
+                    onToggle={() => setExpandedModel(expandedModel === m.id ? null : m.id)}
+                  />
+                ))}
+                {data.models.length === 0 && (
+                  <tr><td colSpan={7} className="empty">No model data for this date</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          {/* All trades feed */}
+          <div className="activity-section">
+            <button className="activity-toggle" onClick={() => setTradesOpen(!tradesOpen)}>
+              All Trades ({data.trades.length}) {tradesOpen ? '\u25B2' : '\u25BC'}
+            </button>
+            {tradesOpen && (
+              <div className="activity-feed">
+                {data.trades.map((t, i) => (
+                  <div key={i} className={`trade-row ${t.side === 'buy' ? 'buy' : 'sell'}`}>
+                    <span className="time">{t.filled_at ? new Date(t.filled_at).toLocaleTimeString() : ''}</span>
+                    <span className="model">{t.model_name}</span>
+                    <span className={`side ${t.side}`}>{t.side}</span>
+                    <span className="qty">{t.quantity.toFixed(2)}</span>
+                    <span className="sym">{t.symbol}</span>
+                    <span className="price">@ {formatMoney(t.fill_price)}</span>
+                    {t.realized_pnl != null && t.realized_pnl !== 0 && (
+                      <span className={cls(t.realized_pnl)}>{formatMoney(t.realized_pnl)}</span>
+                    )}
+                  </div>
+                ))}
+                {data.trades.length === 0 && <div className="empty">No trades</div>}
+              </div>
+            )}
+          </div>
+        </>
+      )}
+
+      {!data && !loading && selectedDate && (
+        <div className="empty">No data for {selectedDate}</div>
+      )}
+    </div>
+  )
+}
+
+function LeaderboardRow({ model: m, expanded, trades, onToggle }: {
+  model: HistoryModel; expanded: boolean;
+  trades: { model_name: string; symbol: string; side: string; quantity: number; fill_price: number; realized_pnl: number | null; filled_at: string | null }[];
+  onToggle: () => void;
+}) {
+  return (
+    <>
+      <tr className={`leaderboard-row ${cls(m.return_pct)} clickable`} onClick={onToggle}>
+        <td>{m.rank}</td>
+        <td className="model-name-cell">{m.name}</td>
+        <td><span className="strategy-tag">{m.strategy_type}</span></td>
+        <td className={cls(m.return_pct)}>{formatPct(m.return_pct)}</td>
+        <td className={cls(m.realized_pnl)}>{formatMoney(m.realized_pnl)}</td>
+        <td>{m.trade_count}</td>
+        <td>{m.win_rate.toFixed(1)}%</td>
+      </tr>
+      {expanded && trades.length > 0 && (
+        <tr className="expanded-trades-row">
+          <td colSpan={7}>
+            <div className="expanded-trades">
+              {trades.map((t, i) => (
+                <div key={i} className={`trade-row ${t.side === 'buy' ? 'buy' : 'sell'}`}>
+                  <span className="time">{t.filled_at ? new Date(t.filled_at).toLocaleTimeString() : ''}</span>
+                  <span className={`side ${t.side}`}>{t.side}</span>
+                  <span className="qty">{t.quantity.toFixed(2)}</span>
+                  <span className="sym">{t.symbol}</span>
+                  <span className="price">@ {formatMoney(t.fill_price)}</span>
+                  {t.realized_pnl != null && t.realized_pnl !== 0 && (
+                    <span className={cls(t.realized_pnl)}>{formatMoney(t.realized_pnl)}</span>
+                  )}
+                </div>
+              ))}
+            </div>
+          </td>
+        </tr>
+      )}
+      {expanded && trades.length === 0 && (
+        <tr className="expanded-trades-row">
+          <td colSpan={7}><div className="no-positions">No trades for this model</div></td>
+        </tr>
+      )}
+    </>
   )
 }
 

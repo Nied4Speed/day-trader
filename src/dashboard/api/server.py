@@ -801,12 +801,10 @@ async def model_trades(model_id: int, session_date: Optional[str] = None):
                 Order.status == OrderStatus.FILLED,
             )
         )
-        # If arena is running, scope to current session start time to exclude
-        # stale fills from previous (reset) sessions on the same date.
-        if _arena_instance and hasattr(_arena_instance, 'tracker') and _arena_instance.tracker._session_start_utc:
-            order_query = order_query.filter(
-                Order.filled_at >= _arena_instance.tracker._session_start_utc
-            )
+        # NOTE: Previously filtered by tracker._session_start_utc to exclude
+        # stale fills from reset sessions. Removed because resume sets a new
+        # start time that excludes valid pre-resume fills. session_date filter
+        # is sufficient — capital resets between days, not mid-day resumes.
         orders = order_query.order_by(Order.filled_at.asc()).all()
 
         # Group orders by symbol, then pair buys with sells chronologically

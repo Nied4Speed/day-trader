@@ -742,6 +742,10 @@ on live Alpaca paper trading data. Each model has $2,000 starting capital.
 - **Capital**: $2,000 per model per day ($24,000 total portfolio). Capital resets daily.
 - **Fractional shares**: Enabled (min 0.01 shares or $1 notional). Market orders only for fractional.
 - **Risk defaults**: stop_loss_pct=2.0%, take_profit_pct=3.0% (evolvable via self-improvement).
+- **Trailing stop** (NEW, disabled by default): `trailing_stop_pct` = how far below peak to sell,
+  `trailing_stop_activation_pct` = minimum gain before trailing stop activates. Example: activation=1.0,
+  trailing=1.5 means once a position is up 1%, sell if it drops 1.5% from its high-water mark.
+  This lets winners run while locking in gains. Set both params to enable. Recommend per-model.
 - **Position manager**: 15% max exposure per symbol, 80% max total exposure, correlation guards,
   3% drawdown halves position sizes, 5% drawdown blocks new buys.
 - **Screener**: Discovers top 20 most-active symbols ($5 price floor), re-runs every 15 min.
@@ -764,19 +768,24 @@ running.
 
 **You can and should recommend changes to the roster.** Specifically:
 - **Eliminate underperformers**: If a strategy type is consistently losing, recommend we remove
-  it and replace it with something better. Name the specific model(s) to cut.
+  it and replace it with something better. Name the specific model(s) to cut. Be aggressive —
+  a model that loses money day after day is actively hurting the portfolio. Don't give it infinite
+  chances. If it lost money yesterday AND today, that's enough evidence to recommend replacement.
 - **Add new strategy types**: If you think a different approach would work better (pairs trading,
   statistical arbitrage, volume profile, order flow, gamma scalping, etc.), recommend it. We will
-  implement it.
+  implement it. Include a brief description of the strategy logic so we can build it.
 - **Rebalance the mix**: If one strategy type dominates, recommend adding more variants of it
   or reducing over-represented losers.
+- **Replace stale models**: Models that consistently fail to trade (0 trades across multiple days)
+  are wasting a slot. Recommend replacing them with something that will actually participate.
 - **Your generated strategy counts as one of the 12 slots.** If you want to test a radically
   different approach, you can — just build it in your generated_strategy output.
 
 The constraint: we want to keep exactly 13 models total (12 base + your cfa_generated model).
 So any additions require removing an equal number. Think of it as portfolio construction — which
 13 strategies give us the best risk-adjusted returns? You always keep your own slot, but you can
-recommend replacing any of the other 12.
+recommend replacing any of the other 12. The operator will act on your recommendations, so be
+direct and decisive — "consider removing" is weaker than "replace X with Y because Z".
 
 Include roster recommendations in your action_items if you think changes are warranted.
 
@@ -942,6 +951,34 @@ capital through spread/slippage. Consider recommending a post-stop-loss cooldown
 the symbol for N bars after a stop-loss fires) or other re-entry discipline for models exhibiting
 this pattern. Check the trade history for rapid buy-sell-buy sequences on the same symbol.
 
+BUG FIX — SELL ORDERS WERE BLOCKED BY CIRCUIT BREAKER (fixed mid-session ~9:53 AM ET today):
+The daily loss circuit breaker was incorrectly blocking ALL orders (including sells) once a model
+exceeded its max daily loss. This meant stop-losses, take-profits, and all exit signals were rejected
+for any model that hit the loss limit. Models were trapped in losing positions with no way to exit
+until end-of-session liquidation. This was the worst possible failure mode — the models losing the
+most were prevented from cutting their losses. The fix (applied ~9:53 AM ET) exempts sell orders
+from the daily loss check so exits always go through. When analyzing today's data:
+- Trades before ~9:53 AM ET were affected by this bug. Models may show unexpectedly large losses
+  from positions they should have exited via stop-loss or take-profit but couldn't.
+- Trades after ~9:53 AM ET reflect correct behavior with working exits.
+- Weight your analysis toward post-fix performance when evaluating model quality.
+- Any model that appears to have "held through" a stop-loss or take-profit trigger before 9:53 AM
+  was a victim of this bug, not a strategy failure.
+
+BUG FIX #2 — PRICE DATA DROPPED FOR HELD POSITIONS (fixed ~10:07 AM ET today):
+The symbol screener rotates the trading universe every 15 minutes based on volume rankings.
+When the arena resumed after a restart, the screener picked a new set of 20 symbols that did NOT
+include 6 symbols with open positions: EEM, F, HYG, NVD, PLTD, SOFI. Without price data, the
+arena could not evaluate stop-losses or take-profits for these positions — they were completely
+blind. For example, PLTD was up +2.2% (approaching the 3% take-profit) but the arena showed it
+at the stale entry price. The fix ensures all symbols with open positions are always included in
+the subscription, regardless of screener results. When analyzing today's data:
+- Between ~9:53 AM and ~10:07 AM ET, positions in EEM, F, HYG, NVD, PLTD, SOFI had no working
+  stop-loss or take-profit because no price updates were being received.
+- Any missed take-profits or excess losses on these 6 symbols during that window were caused by
+  this bug, not strategy failure.
+- After ~10:07 AM ET, all position symbols are subscribed and exits work correctly.
+
 DATA REQUESTS — Your goal is to maximize returns and minimize losses. Include a "data_requests"
 array listing ANY additional data that would help you build a better strategy. Think about what
 a top quantitative fund would want: order book depth, tick-level data, options flow/Greeks,
@@ -971,6 +1008,31 @@ OPEN QUESTIONS — include an "open_questions" array in your response with your 
    the first 30-60 minutes while adaptation calibrates, then ramp up to full allocation. Analyze the
    intraday performance curve (early vs late trades) and the performance_snapshots timing to determine
    if this pattern exists in the data. If it does, recommend a specific ramp-up schedule.
+3. "Trailing stops" — We added trailing stop support today after watching PLTD climb +2.5% but
+   not hit the fixed 3% take-profit. The concern: a position can run up significantly, then give
+   back all its gains before hitting take-profit. Trailing stops solve this by selling when price
+   drops a set percentage below its peak. The params are `trailing_stop_pct` (drop from peak to
+   trigger, e.g. 1.5%) and `trailing_stop_activation_pct` (min gain before activating, e.g. 1.0%).
+   Both are currently disabled (None) on all models. Should we enable them? If so, recommend
+   specific values per model in your parameter_recommendations. Consider: should trailing stops
+   replace take-profits, complement them, or only be used on certain strategy types?
+4. "Missing exit mechanisms" — Today we discovered that our sell/exit infrastructure had critical
+   bugs (circuit breaker blocking sells, missing price data for held positions). This made us
+   realize we should think harder about exit discipline. Are there other exit mechanisms we should
+   support beyond stop-loss, take-profit, and trailing stop? Examples: time-based exits (sell after
+   N bars regardless), volatility-adjusted stops (wider stops in volatile regimes), partial profit
+   taking (sell half at +2%, let rest ride), momentum reversal exits, etc. Recommend any additional
+   exit types that would improve risk management, and we will implement them.
+5. "Opening volatility losses" — The operator has observed a consistent pattern across multiple days:
+   models lose money in the first 10-15 minutes after market open (9:30-9:45 ET), then recover later.
+   The opening auction creates wide spreads, volatile price swings, and unreliable signals. Analyze
+   today's trade-level data to quantify this: what % of losses occurred in the first 15 min? Are
+   certain strategy types worse offenders (e.g., breakout chasing false moves, mean-reversion buying
+   into momentum)? Recommend concrete mitigations — possible approaches include: (a) a market-open
+   cooldown that delays all trading for N minutes, (b) reduced position sizing in the first 15-30 min,
+   (c) different strategy activation schedules (e.g., momentum strategies wait 15 min, mean-reversion
+   waits 5 min), or (d) an opening-specific strategy that trades the open differently. Be specific
+   about what you'd implement and why.
 
 ## Strategy Generation
 

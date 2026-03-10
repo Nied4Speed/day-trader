@@ -94,6 +94,11 @@ class Strategy(ABC):
         # Strategies can override in their own __init__/set_params.
         self.stop_loss_pct: Optional[float] = 2.0
         self.take_profit_pct: Optional[float] = 3.0
+        # Trailing stop — disabled by default. CFA can enable per model.
+        # trailing_stop_pct: how far below the high-water mark to trigger (e.g., 1.5 = 1.5%)
+        # trailing_stop_activation_pct: minimum gain before trailing stop activates (e.g., 1.0 = 1%)
+        self.trailing_stop_pct: Optional[float] = None
+        self.trailing_stop_activation_pct: Optional[float] = None
         # LLM-generated watch rules (list of rule dicts)
         self._watch_rules: list[dict] = []
         # Cached indicator values per symbol, updated each on_bar()

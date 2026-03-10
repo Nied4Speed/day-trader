@@ -87,6 +87,8 @@ class Arena:
         self._incident_notes: list[str] = []
         # Track stop-loss/take-profit fires to avoid re-triggering: set of (model_id, symbol)
         self._stop_loss_fired: set[tuple[int, str]] = set()
+        # High-water mark per position for trailing stops: (model_id, symbol) -> highest price seen
+        self._high_water_mark: dict[tuple[int, str], float] = {}
 
     def add_incident_note(self, note: str) -> None:
         """Add an operational incident note that will be included in the CFA review."""
@@ -620,12 +622,28 @@ class Arena:
                         triggered = "stop_loss"
                     elif strategy.take_profit_pct and pct_change >= strategy.take_profit_pct:
                         triggered = "take_profit"
+                    else:
+                        # Trailing stop: track high-water mark and sell if price
+                        # drops trailing_stop_pct below the peak.
+                        hwm_key = (model_id, symbol)
+                        if strategy.trailing_stop_pct and strategy.trailing_stop_activation_pct:
+                            hwm = self._high_water_mark.get(hwm_key, entry_price)
+                            if price > hwm:
+                                self._high_water_mark[hwm_key] = price
+                                hwm = price
+                            gain_from_entry = (hwm - entry_price) / entry_price * 100.0
+                            if gain_from_entry >= strategy.trailing_stop_activation_pct:
+                                drop_from_peak = (hwm - price) / hwm * 100.0
+                                if drop_from_peak >= strategy.trailing_stop_pct:
+                                    triggered = "trailing_stop"
                     if triggered:
                         signal = TradeSignal(symbol=symbol, side="sell", quantity=qty)
                         liquidation_signals.append(
                             (model_id, signal, strategy.current_capital)
                         )
                         self._stop_loss_fired.add(sl_key)
+                        # Clean up high-water mark on exit
+                        self._high_water_mark.pop((model_id, symbol), None)
                         logger.info(
                             f"[{triggered.upper()}] model {model_id} {symbol}: "
                             f"entry={entry_price:.2f} now={price:.2f} ({pct_change:+.2f}%) "
@@ -696,6 +714,23 @@ class Arena:
             for i, r in enumerate(results):
                 if isinstance(r, Exception):
                     logger.error(f"[BATCH-DBG] order task {i} failed: {r!r}")
+            # Clear _stop_loss_fired for liquidation signals that failed to submit,
+            # so they can re-trigger on the next bar batch. Exits are critical.
+            n_resolved = len(resolved_orders)
+            for j, (mid, sig, _cap) in enumerate(liquidation_signals):
+                result_idx = n_resolved + j
+                if result_idx < len(results):
+                    r = results[result_idx]
+                    failed = isinstance(r, Exception) or r is None or (
+                        hasattr(r, 'status') and r.status.value == 'rejected'
+                    )
+                    if failed:
+                        sl_key = (mid, sig.symbol)
+                        self._stop_loss_fired.discard(sl_key)
+                        logger.warning(
+                            f"[SL/TP RETRY] Cleared stop_loss_fired for model {mid} "
+                            f"{sig.symbol} — will re-trigger next bar"
+                        )
             logger.info(f"[BATCH-DBG] gather done, unlocking symbols...")
             for order in resolved_orders:
                 self.position_manager.unlock_symbol(order.symbol)
@@ -1170,6 +1205,11 @@ class Arena:
                 # Clear stop-loss fired flag on buy (new position can trigger fresh)
                 # or on sell (position gone, flag no longer needed)
                 self._stop_loss_fired.discard((model_id, symbol))
+                # Reset high-water mark on sell (position closed) or buy (new entry)
+                if side == "sell":
+                    self._high_water_mark.pop((model_id, symbol), None)
+                elif side == "buy":
+                    self._high_water_mark[(model_id, symbol)] = price
 
                 # Track fill for intra-session adaptation
                 entry_price = self._models[model_id]._entry_prices.get(symbol, price)
@@ -2009,6 +2049,19 @@ class Arena:
         # Reset daily limits for session 1 only
         if session_number == 1:
             self.execution.reset_daily_limits()
+
+        # Ensure all symbols with open positions are in the trading universe.
+        # The screener may rotate symbols, but we must keep receiving price data
+        # for anything we hold — otherwise stop-losses/take-profits can't fire.
+        positioned = self._get_positioned_symbols()
+        existing = set(self.config.arena.symbols)
+        missing = positioned - existing
+        if missing:
+            self.config.arena.symbols.extend(sorted(missing))
+            logger.info(
+                f"Added {len(missing)} position symbols to universe: "
+                f"{sorted(missing)} (total: {len(self.config.arena.symbols)})"
+            )
 
         # Record session in DB (replace stale record from a failed prior run)
         db = get_session(self.config.db_path)

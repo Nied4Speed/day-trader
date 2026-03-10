@@ -229,15 +229,17 @@ class ExecutionHandler:
         Only enforces daily loss limit - strategies are free to size positions
         however they want to maximize profit.
         """
-        # Check max daily loss
-        daily_pnl = self._daily_pnl.get(model_id, 0.0)
-        max_loss = current_capital * self.config.arena.max_daily_loss_pct
-        if daily_pnl < -max_loss:
-            self._daily_loss_breached.add(model_id)
-            raise RiskLimitExceeded(
-                f"Model {model_id} exceeded max daily loss: "
-                f"{daily_pnl:.2f} < -{max_loss:.2f}"
-            )
+        # Check max daily loss (only block buys — sells must always be allowed
+        # so models can exit positions to cut losses / take profit)
+        if signal.side == "buy":
+            daily_pnl = self._daily_pnl.get(model_id, 0.0)
+            max_loss = current_capital * self.config.arena.max_daily_loss_pct
+            if daily_pnl < -max_loss:
+                self._daily_loss_breached.add(model_id)
+                raise RiskLimitExceeded(
+                    f"Model {model_id} exceeded max daily loss: "
+                    f"{daily_pnl:.2f} < -{max_loss:.2f}"
+                )
 
         # Check that buy orders don't exceed available capital
         if signal.side == "buy":
@@ -350,8 +352,9 @@ class ExecutionHandler:
         if signal.side == "buy" and model_id in self._daily_loss_breached:
             return None
 
-        # Wash trade cooldown check (before DB session to avoid unnecessary work)
-        if self._check_wash_trade(model_id, signal.symbol):
+        # Wash trade cooldown check (buys only — sells must always go through
+        # so stop-losses and take-profits are never blocked)
+        if signal.side == "buy" and self._check_wash_trade(model_id, signal.symbol):
             return None
 
         db = get_session(self.config.db_path)
@@ -421,6 +424,13 @@ class ExecutionHandler:
                             limit_price=signal.limit_price,
                         )
                         fill_qty = signal.quantity
+                    # After clamping, skip if quantity is too small to submit
+                    if signal.quantity < 0.001:
+                        logger.debug(
+                            f"Skipping sell for model {model_id} {signal.symbol}: "
+                            f"clamped qty {signal.quantity:.6f} too small"
+                        )
+                        return None
 
                 # Live mode: submit to Alpaca, let TradingStream handle fill
                 alpaca_side = (

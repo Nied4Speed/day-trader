@@ -35,6 +35,11 @@ LEVERAGED_ETF_BLOCKLIST: set[str] = {
     "BITO", "BITI",
     # Other inverse
     "SH", "PSQ", "DOG", "RWM",
+    # Single-stock leveraged ETFs (correlated duplicates of core symbols)
+    "NVD", "NVDL", "NVDS",  # NVDA leveraged
+    "TSLL", "TSLQ",          # TSLA leveraged
+    "MSTU", "MSTZ",          # MSTR leveraged
+    "CONL",                   # COIN leveraged
 }
 
 

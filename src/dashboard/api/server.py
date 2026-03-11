@@ -902,13 +902,23 @@ async def history_dates():
     """Get distinct dates from DailyLedger, descending (for history date picker)."""
     db = get_dashboard_session(DB_PATH)
     try:
-        dates = (
-            db.query(DailyLedger.session_date)
+        HISTORY_CUTOFF = "2026-03-10"  # earlier dates have bad data
+        # Dates from ledger (completed sessions)
+        ledger_dates = set(
+            d[0] for d in db.query(DailyLedger.session_date)
+            .filter(DailyLedger.session_date >= HISTORY_CUTOFF)
             .distinct()
-            .order_by(DailyLedger.session_date.desc())
             .all()
         )
-        return [d[0] for d in dates]
+        # Also include dates with orders (live session today)
+        order_dates = set(
+            d[0] for d in db.query(Order.session_date)
+            .filter(Order.session_date >= HISTORY_CUTOFF)
+            .distinct()
+            .all()
+        )
+        all_dates = sorted(ledger_dates | order_dates, reverse=True)
+        return all_dates
     finally:
         db.close()
 
@@ -944,6 +954,38 @@ async def daily_history(session_date: str):
             .filter(DailyLedger.session_date == session_date)
             .all()
         )
+
+        # If no ledger yet (session still running), build from active models + orders
+        if not ledger_rows:
+            # Find models that have orders today, or all active models
+            model_ids_with_orders = (
+                db.query(Order.model_id)
+                .filter(Order.session_date == session_date)
+                .distinct()
+                .all()
+            )
+            active_model_ids = {r[0] for r in model_ids_with_orders}
+            if not active_model_ids:
+                # Fall back to models that have snapshots today
+                snap_model_ids = (
+                    db.query(PerformanceSnapshot.model_id)
+                    .filter(PerformanceSnapshot.session_date == session_date)
+                    .distinct()
+                    .all()
+                )
+                active_model_ids = {r[0] for r in snap_model_ids}
+
+            class _FakeLedger:
+                def __init__(self, model_id: int, initial: float):
+                    self.model_id = model_id
+                    self.start_capital = initial
+                    self.end_capital = initial  # will be overridden by realized_pnl
+                    self.daily_return_pct = 0.0
+
+            for mid in active_model_ids:
+                m = db.query(TradingModel).get(mid)
+                if m:
+                    ledger_rows.append(_FakeLedger(mid, m.initial_capital))
 
         models_data = []
         portfolio_pnl = 0.0
@@ -986,14 +1028,21 @@ async def daily_history(session_date: str):
             winning_trades = int(trade_stats.wins or 0) if trade_stats else 0
             realized_pnl = float(trade_stats.realized or 0) if trade_stats else 0
             win_rate = (winning_trades / trade_count * 100) if trade_count > 0 else 0.0
-            return_pct = row.daily_return_pct
+
+            # Use ledger return_pct if available, otherwise compute from realized P&L
+            if hasattr(row, 'daily_return_pct') and isinstance(row.daily_return_pct, (int, float)) and row.daily_return_pct != 0:
+                return_pct = row.daily_return_pct
+            else:
+                return_pct = (realized_pnl / row.start_capital * 100) if row.start_capital > 0 else 0.0
+
+            end_capital = row.end_capital if row.end_capital != row.start_capital else row.start_capital + realized_pnl
 
             models_data.append({
                 "id": row.model_id,
                 "name": model.name,
                 "strategy_type": model.strategy_type,
                 "start_capital": row.start_capital,
-                "end_capital": row.end_capital,
+                "end_capital": round(end_capital, 2),
                 "return_pct": round(return_pct, 2),
                 "realized_pnl": round(realized_pnl, 2),
                 "trade_count": trade_count,
@@ -1005,7 +1054,7 @@ async def daily_history(session_date: str):
             portfolio_trades += trade_count
             portfolio_wins += winning_trades
             portfolio_initial += row.start_capital
-            portfolio_end += row.end_capital
+            portfolio_end += end_capital
 
         # Sort by return % desc
         models_data.sort(key=lambda m: m["return_pct"], reverse=True)

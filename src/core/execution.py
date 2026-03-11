@@ -233,7 +233,9 @@ class ExecutionHandler:
         # so models can exit positions to cut losses / take profit)
         if signal.side == "buy":
             daily_pnl = self._daily_pnl.get(model_id, 0.0)
-            max_loss = current_capital * self.config.arena.max_daily_loss_pct
+            # Use initial_capital (budget ceiling) so the check works even when
+            # current_capital is negative (all capital deployed in positions).
+            max_loss = self.config.arena.initial_capital * self.config.arena.max_daily_loss_pct
             if daily_pnl < -max_loss:
                 self._daily_loss_breached.add(model_id)
                 raise RiskLimitExceeded(
@@ -303,6 +305,42 @@ class ExecutionHandler:
             except APIError as e:
                 status_code = getattr(e, "status_code", None)
                 is_retryable = status_code in (429, 500, 502, 503, 504)
+
+                # Insufficient qty: parse available amount and retry with it
+                err_str = str(e)
+                is_insufficient_qty = "insufficient qty available" in err_str.lower()
+                if is_insufficient_qty and is_sell and attempt < max_retries:
+                    import re as _re
+                    avail_match = _re.search(r'"available"\s*:\s*"?([\d.]+)', err_str)
+                    if avail_match:
+                        available = float(avail_match.group(1))
+                        if available >= 0.001:
+                            logger.warning(
+                                f"Insufficient qty on sell attempt {attempt + 1}, "
+                                f"retrying with available={available:.6f}"
+                            )
+                            request.qty = available
+                            time.sleep(0.3)
+                            continue
+                        else:
+                            logger.info(
+                                f"Insufficient qty on sell: available={available:.6f} "
+                                f"too small, giving up"
+                            )
+                            raise
+
+                # Wash trade rejection: cancel conflicting orders and retry
+                is_wash_trade = "wash trade" in err_str.lower()
+                if is_wash_trade and is_sell and attempt < max_retries:
+                    symbol = getattr(request, "symbol", None)
+                    logger.warning(
+                        f"Wash trade on sell attempt {attempt + 1}, "
+                        f"cancelling open orders for {symbol} and retrying..."
+                    )
+                    if symbol:
+                        self._cancel_open_orders_for_symbol(symbol)
+                    time.sleep(0.5)
+                    continue
 
                 if is_retryable and attempt < max_retries:
                     delay = backoff_delays[attempt]
@@ -436,8 +474,21 @@ class ExecutionHandler:
                 alpaca_side = (
                     AlpacaOrderSide.BUY if signal.side == "buy" else AlpacaOrderSide.SELL
                 )
+
+                # Cancel conflicting open orders before sells to prevent
+                # wash trade rejections (shared Alpaca account means another
+                # model's pending buy on the same symbol blocks our sell).
+                if signal.side == "sell":
+                    self._cancel_open_orders_for_symbol(signal.symbol)
+
                 try:
                     request = self._build_order_request(signal, alpaca_side)
+                    if request is None:
+                        logger.debug(
+                            f"Skipping {signal.side} for model {model_id} {signal.symbol}: "
+                            f"qty {signal.quantity:.4f} too small for non-fractionable symbol"
+                        )
+                        return None
 
                     alpaca_order = self._submit_with_retry(
                         request, is_sell=(signal.side == "sell")
@@ -462,6 +513,7 @@ class ExecutionHandler:
                         quantity=signal.quantity, order_type=signal.order_type,
                         limit_price=signal.limit_price, status=OrderStatus.REJECTED,
                         rejected_reason=str(e), submitted_at=datetime.utcnow(),
+                        signal_reason=signal.reason,
                     )
                     db.add(order)
                     db.commit()
@@ -481,6 +533,7 @@ class ExecutionHandler:
                 fill_price=fill_price, fill_quantity=fill_qty,
                 transaction_cost=tx_cost if fill_price else 0.0,
                 alpaca_order_id=alpaca_order_id,
+                signal_reason=signal.reason,
                 submitted_at=datetime.utcnow(),
                 filled_at=datetime.utcnow() if fill_price else None,
             )
@@ -572,11 +625,48 @@ class ExecutionHandler:
 
         # Market order: use fractional qty only if symbol supports it
         if not self._is_fractionable(signal.symbol):
-            qty = max(1, int(qty))  # floor to whole shares, min 1
+            qty = int(qty)  # floor to whole shares
+            if qty < 1:
+                return None  # too small for non-fractionable symbol
         return MarketOrderRequest(
             symbol=signal.symbol, qty=qty,
             side=alpaca_side, time_in_force=TimeInForce.DAY,
         )
+
+    def submit_extended_hours_sell(
+        self, symbol: str, qty: float, limit_price: float
+    ) -> str | None:
+        """Submit an extended-hours limit sell order for after-market liquidation.
+
+        Alpaca rejects fractional limit orders, so qty is floored to whole shares.
+        Returns Alpaca order ID on success, None on failure.
+        """
+        whole_qty = int(qty)
+        if whole_qty < 1:
+            logger.warning(
+                f"Extended-hours sell skipped: {symbol} qty {qty:.4f} "
+                f"floors to 0 whole shares (fractional can't trade after hours)"
+            )
+            return None
+
+        request = LimitOrderRequest(
+            symbol=symbol,
+            qty=whole_qty,
+            side=AlpacaOrderSide.SELL,
+            time_in_force=TimeInForce.DAY,
+            limit_price=round(limit_price, 2),
+            extended_hours=True,
+        )
+        try:
+            result = self._submit_with_retry(request, is_sell=True)
+            logger.info(
+                f"Extended-hours sell submitted: {symbol} x{whole_qty} "
+                f"@ ${limit_price:.2f} (order {result.id})"
+            )
+            return str(result.id)
+        except Exception as e:
+            logger.error(f"Extended-hours sell FAILED for {symbol}: {e}")
+            return None
 
     def cancel_bracket_legs(self, alpaca_order_id: str) -> None:
         """Cancel outstanding bracket legs (stop-loss/take-profit) after manual exit.
@@ -699,7 +789,8 @@ class ExecutionHandler:
             positions = db.query(Position).filter(Position.quantity > 0).all()
             for pos in positions:
                 signal = TradeSignal(
-                    symbol=pos.symbol, side="sell", quantity=pos.quantity
+                    symbol=pos.symbol, side="sell", quantity=pos.quantity,
+                    reason="eod_liquidation",
                 )
                 model = db.query(TradingModel).get(pos.model_id)
                 capital = model.current_capital if model else 0.0
@@ -717,28 +808,227 @@ class ExecutionHandler:
             db.close()
         return closed
 
-    def liquidate_all_alpaca(self) -> int:
-        """Hard safety net: close ALL positions directly on Alpaca.
+    def liquidate_all_alpaca(self, session_date: str) -> int:
+        """Safety net: close remaining Alpaca positions via tracked per-model orders.
 
-        Bypasses our order flow entirely. Use when our DB positions
-        don't match Alpaca (shared account problem).
+        Queries Alpaca for positions that survived ``liquidate_all()``, then
+        submits individual sell orders through our normal order flow so every
+        close gets a model_id, alpaca_order_id, and realized_pnl.
+
+        Falls back to the blunt ``close_all_positions()`` only if individual
+        closes fail entirely.
         """
         if self.simulate:
             return 0
         try:
             self._throttle()
-            positions = self.client.get_all_positions()
-            if not positions:
-                logger.info("Alpaca: no positions to liquidate")
+            alpaca_positions = self.client.get_all_positions()
+            if not alpaca_positions:
+                logger.info("Alpaca safety net: no remaining positions")
                 return 0
-            logger.info(f"Alpaca: closing {len(positions)} positions directly")
-            self._throttle()
-            self.client.close_all_positions(cancel_orders=True)
-            logger.info("Alpaca: all positions closed")
-            return len(positions)
+            logger.info(
+                f"Alpaca safety net: {len(alpaca_positions)} positions still open, "
+                f"submitting tracked closes"
+            )
         except Exception:
-            logger.exception("Failed to liquidate via Alpaca API")
+            logger.exception("Failed to fetch Alpaca positions for safety net")
             return 0
+
+        closed = 0
+        failed_symbols = []
+
+        for ap in alpaca_positions:
+            symbol = ap.symbol
+            alpaca_qty = float(ap.qty)
+            if alpaca_qty < 0.001:
+                continue
+
+            # Find which models hold this symbol in our DB
+            db = get_session(self.config.db_path)
+            try:
+                db_positions = (
+                    db.query(Position)
+                    .filter(Position.symbol == symbol, Position.quantity > 0)
+                    .order_by(Position.quantity.desc())
+                    .all()
+                )
+
+                if db_positions:
+                    # Submit tracked sells for each model's share
+                    for pos in db_positions:
+                        sell_qty = min(pos.quantity, alpaca_qty)
+                        if sell_qty < 0.001:
+                            continue
+                        model = db.query(TradingModel).get(pos.model_id)
+                        capital = model.current_capital if model else 0.0
+                        db.close()
+
+                        signal = TradeSignal(
+                            symbol=symbol, side="sell", quantity=sell_qty,
+                            reason="alpaca_safety_net",
+                        )
+                        try:
+                            self.submit_order(
+                                model_id=pos.model_id,
+                                signal=signal,
+                                current_capital=capital,
+                                session_date=session_date,
+                            )
+                            closed += 1
+                            alpaca_qty -= sell_qty
+                        except Exception:
+                            logger.exception(
+                                f"Failed tracked close: model {pos.model_id} "
+                                f"{symbol} qty={sell_qty:.4f}"
+                            )
+                            failed_symbols.append(symbol)
+
+                        db = get_session(self.config.db_path)
+                        if alpaca_qty < 0.001:
+                            break
+                else:
+                    # Alpaca position with no DB match — close directly
+                    logger.warning(
+                        f"Alpaca safety net: untracked position {symbol} "
+                        f"qty={alpaca_qty:.4f}, closing directly via API"
+                    )
+                    try:
+                        self._throttle()
+                        self.client.close_position(symbol)
+                        closed += 1
+                    except Exception:
+                        logger.exception(f"Failed to close untracked position {symbol}")
+                        failed_symbols.append(symbol)
+            finally:
+                db.close()
+
+        # Last resort: if any individual closes failed, use the blunt hammer
+        if failed_symbols:
+            logger.warning(
+                f"Alpaca safety net: {len(failed_symbols)} symbols failed "
+                f"individual close ({failed_symbols}), falling back to close_all_positions"
+            )
+            try:
+                self._throttle()
+                self.client.close_all_positions(cancel_orders=True)
+            except Exception:
+                logger.exception("close_all_positions fallback also failed")
+
+        logger.info(f"Alpaca safety net: closed {closed} positions via tracked orders")
+        return closed
+
+    def reconcile_fills_with_alpaca(self, session_date: str) -> dict:
+        """Reconcile DB orders against Alpaca's filled orders for the day.
+
+        Now that all liquidation goes through tracked orders, this only needs to:
+        1. Resolve PENDING orders that filled after TradingStream stopped
+        2. Warn about any Alpaca fills we have no record of at all
+
+        Returns {"updated": N, "untracked": N, "skipped": N}.
+        """
+        if self.simulate:
+            return {"skipped": True, "reason": "simulate mode"}
+
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+
+        from datetime import timezone
+        today_start = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        try:
+            self._throttle()
+            alpaca_orders = self.client.get_orders(
+                GetOrdersRequest(
+                    status=QueryOrderStatus.CLOSED,
+                    after=today_start,
+                    limit=500,
+                )
+            )
+        except Exception:
+            logger.exception("Failed to fetch Alpaca orders for fill reconciliation")
+            return {"error": "failed to fetch Alpaca orders"}
+
+        stats = {"updated": 0, "untracked": 0, "skipped": 0}
+        db = get_session(self.config.db_path)
+        try:
+            for ao in alpaca_orders:
+                if str(ao.status) not in ("filled",):
+                    stats["skipped"] += 1
+                    continue
+
+                filled_price = float(ao.filled_avg_price) if ao.filled_avg_price else None
+                filled_qty = float(ao.filled_qty) if ao.filled_qty else None
+                if not filled_price or not filled_qty:
+                    stats["skipped"] += 1
+                    continue
+
+                alpaca_id = str(ao.id)
+                symbol = ao.symbol
+                side_str = str(ao.side).lower()
+
+                # Check if we already have this order tracked
+                existing = (
+                    db.query(Order)
+                    .filter(Order.alpaca_order_id == alpaca_id)
+                    .first()
+                )
+
+                if existing and existing.status == OrderStatus.FILLED:
+                    stats["skipped"] += 1
+                    continue
+
+                if existing and existing.status == OrderStatus.PENDING:
+                    # Resolve PENDING -> FILLED
+                    tx_cost = filled_price * filled_qty * self.config.arena.transaction_cost_pct
+                    existing.status = OrderStatus.FILLED
+                    existing.fill_price = filled_price
+                    existing.fill_quantity = filled_qty
+                    existing.transaction_cost = tx_cost
+                    existing.filled_at = ao.filled_at or datetime.utcnow()
+
+                    signal = TradeSignal(
+                        symbol=symbol, side=side_str, quantity=filled_qty,
+                        reason="reconciled_pending",
+                    )
+                    self._update_position(
+                        db, existing.model_id, signal,
+                        filled_price, filled_qty, tx_cost, db_order=existing,
+                    )
+                    db.flush()
+                    stats["updated"] += 1
+                    logger.info(
+                        f"Reconcile: PENDING -> FILLED: "
+                        f"model {existing.model_id} {side_str} "
+                        f"{filled_qty} {symbol} @ {filled_price:.2f}"
+                    )
+                    continue
+
+                if not existing:
+                    # Alpaca fill with no DB record at all — shouldn't happen
+                    # now that liquidate_all_alpaca uses tracked orders, but
+                    # log it so we can investigate.
+                    stats["untracked"] += 1
+                    logger.warning(
+                        f"Reconcile: untracked Alpaca fill {alpaca_id}: "
+                        f"{side_str} {filled_qty} {symbol} @ {filled_price:.2f} "
+                        f"— no matching DB order"
+                    )
+
+            db.commit()
+            logger.info(
+                f"Fill reconciliation complete: "
+                f"updated={stats['updated']}, untracked={stats['untracked']}, "
+                f"skipped={stats['skipped']}"
+            )
+        except Exception:
+            db.rollback()
+            logger.exception("Fill reconciliation failed")
+            stats["error"] = "reconciliation failed"
+        finally:
+            db.close()
+
+        return stats
 
     def reconcile_positions_with_alpaca(self) -> dict:
         """Sync DB positions with actual Alpaca positions.

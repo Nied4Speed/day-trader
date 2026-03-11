@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import random
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, time, timedelta
 from typing import Optional
@@ -85,18 +86,27 @@ class Arena:
         self._last_watch_dispatch: dict[tuple, float] = {}  # (model_id, symbol) -> last dispatch time
         # Incident notes for CFA review — operational issues that affect data interpretation
         self._incident_notes: list[str] = []
+        # Per-model symbol locks: (model_id, symbol) with pending orders
+        self._model_symbol_locks: set[tuple[int, str]] = set()
         # Track stop-loss/take-profit fires to avoid re-triggering: set of (model_id, symbol)
         self._stop_loss_fired: set[tuple[int, str]] = set()
         # High-water mark per position for trailing stops: (model_id, symbol) -> highest price seen
         self._high_water_mark: dict[tuple[int, str], float] = {}
+        # Underwater bar counter for patience stops: (model_id, symbol) -> consecutive bars below entry
+        self._bars_underwater: dict[tuple[int, str], int] = {}
+        # Stagnation bar counter for profit stagnation exits: (model_id, symbol) -> consecutive flat bars
+        self._stagnation_bars: dict[tuple[int, str], int] = {}
+        self._watch_stats: dict[str, int] = {"created": 0, "expired": 0, "converted": 0}
+        # Quote aggregator for synthetic bars (created per session)
+        self._quote_aggregator: Optional[QuoteAggregator] = None
+        # Health check state
+        self._last_health_check: dict = {}
+        self._health_check_interval_minutes: int = 30
 
     def add_incident_note(self, note: str) -> None:
         """Add an operational incident note that will be included in the CFA review."""
         self._incident_notes.append(note)
         logger.info(f"Incident note added: {note}")
-        self._watch_stats: dict[str, int] = {"created": 0, "expired": 0, "converted": 0}
-        # Quote aggregator for synthetic bars (created per session)
-        self._quote_aggregator: Optional[QuoteAggregator] = None
 
     def _set_status(self, phase: str, detail: str = "", bar: int | None = None, total_bars: int | None = None) -> None:
         """Write current arena phase to a status file for the dashboard."""
@@ -243,6 +253,28 @@ class Arena:
                 strategy.stop_loss_pct = max(0.5, min(10.0, float(params["stop_loss_pct"])))
             if "take_profit_pct" in params:
                 strategy.take_profit_pct = max(0.5, min(15.0, float(params["take_profit_pct"])))
+            # Load ratcheting trailing stop tiers
+            if "trailing_stop_tiers" in params and isinstance(params["trailing_stop_tiers"], list):
+                try:
+                    tiers = [(float(t[0]), float(t[1])) for t in params["trailing_stop_tiers"]]
+                    tiers.sort(key=lambda t: t[0])
+                    strategy.trailing_stop_tiers = tiers
+                except (TypeError, IndexError, ValueError):
+                    logger.warning(f"Invalid trailing_stop_tiers for {model.name}, ignoring")
+            elif params.get("trailing_stop_pct") and params.get("trailing_stop_activation_pct"):
+                # Migrate old fixed trailing stop to single-tier
+                act = float(params["trailing_stop_activation_pct"])
+                trail = float(params["trailing_stop_pct"])
+                strategy.trailing_stop_tiers = [(act, trail)]
+                logger.info(f"Migrated {model.name} trailing stop to single tier: [({act}, {trail})]")
+            # Load patience stop tiers
+            if "patience_stop_tiers" in params and isinstance(params["patience_stop_tiers"], list):
+                try:
+                    tiers = [(int(t[0]), float(t[1])) for t in params["patience_stop_tiers"]]
+                    tiers.sort(key=lambda t: t[0])
+                    strategy.patience_stop_tiers = tiers
+                except (TypeError, IndexError, ValueError):
+                    logger.warning(f"Invalid patience_stop_tiers for {model.name}, ignoring")
             self._models[model.id] = strategy
             self._model_records[model.id] = model
 
@@ -296,18 +328,25 @@ class Arena:
             self._set_status("session", f"Session {self._session_number} trading", bar=self._bar_count)
         session_date = self._session_date
 
-        # Set time remaining so strategies know when to liquidate
+        # Set time remaining so strategies know when to liquidate.
+        # In live mode, wind-down is anchored to market close minus buffer
+        # (= 3:58 PM ET with 2-min buffer) so liquidation ALWAYS fires at
+        # a fixed time regardless of when the session started.
         if self._session_start_time:
             session_mins = self._current_session_minutes or self.config.arena.session_1_minutes
-            bar.minutes_remaining = max(
+            session_remaining = max(
                 0.0,
                 session_mins - self._session_elapsed_minutes(),
             )
             if not self.simulate:
-                market_remaining = self._minutes_until_market_close()
-                bar.minutes_remaining = min(
-                    bar.minutes_remaining, market_remaining
+                buffer = self.config.arena.market_close_buffer_minutes
+                market_remaining = max(
+                    0.0,
+                    self._minutes_until_market_close() - buffer,
                 )
+                bar.minutes_remaining = min(session_remaining, market_remaining)
+            else:
+                bar.minutes_remaining = session_remaining
         else:
             bar.minutes_remaining = None
 
@@ -373,50 +412,42 @@ class Arena:
 
         await asyncio.to_thread(_process_models)
 
-        # Resolve conflicting signals through Position Manager
-        resolved_orders = self.position_manager.resolve(model_signals)
-
-        if resolved_orders:
+        # Independent model trading: submit each model's order directly
+        if model_signals:
             logger.info(
                 f"Bar {self._bar_count}: {len(model_signals)} signals -> "
-                f"{len(resolved_orders)} resolved orders"
+                f"independent orders"
             )
 
-        # Submit resolved orders
         if self.simulate:
-            for order in resolved_orders:
-                # In sim mode, pick the model with highest weight to attribute
-                primary_model = max(order.contributing_models, key=lambda x: x[1])[0]
-                signal = TradeSignal(
-                    symbol=order.symbol, side=order.side, quantity=order.quantity
-                )
-                strategy = self._models[primary_model]
+            for ms in model_signals:
+                strategy = self._models[ms.model_id]
                 self.execution.submit_order(
-                    model_id=primary_model,
-                    signal=signal,
+                    model_id=ms.model_id,
+                    signal=ms.signal,
                     current_capital=strategy.current_capital,
                     session_date=session_date,
                 )
-                self._refresh_model_state(primary_model, strategy)
+                self._refresh_model_state(ms.model_id, strategy)
         else:
-            # Live mode: submit resolved orders + liquidation signals
+            # Live mode: submit all model orders + liquidation signals
             async_tasks = []
-            for order in resolved_orders:
-                primary_model = max(order.contributing_models, key=lambda x: x[1])[0]
-                signal = TradeSignal(
-                    symbol=order.symbol, side=order.side, quantity=order.quantity
-                )
-                self.position_manager.lock_symbol(order.symbol)
+            task_model_ids: list[int] = []
+            for ms in model_signals:
+                lock_key = (ms.model_id, ms.signal.symbol)
+                if lock_key in self._model_symbol_locks:
+                    continue
+                self._model_symbol_locks.add(lock_key)
                 async_tasks.append(
                     self.execution.async_submit_order(
-                        model_id=primary_model,
-                        signal=signal,
-                        current_capital=self._models[primary_model].current_capital,
+                        model_id=ms.model_id,
+                        signal=ms.signal,
+                        current_capital=self._models[ms.model_id].current_capital,
                         session_date=session_date,
                     )
                 )
+                task_model_ids.append(ms.model_id)
 
-            # Liquidation signals go directly (bypass position manager)
             for mid, sig, cap in liquidation_signals:
                 async_tasks.append(
                     self.execution.async_submit_order(
@@ -424,16 +455,13 @@ class Arena:
                         current_capital=cap, session_date=session_date,
                     )
                 )
+                task_model_ids.append(mid)
 
             if async_tasks:
                 await asyncio.gather(*async_tasks, return_exceptions=True)
-                # Unlock symbols and refresh
-                for order in resolved_orders:
-                    self.position_manager.unlock_symbol(order.symbol)
-                all_model_ids = set(
-                    [max(o.contributing_models, key=lambda x: x[1])[0] for o in resolved_orders]
-                    + [mid for mid, _, _ in liquidation_signals]
-                )
+                for ms in model_signals:
+                    self._model_symbol_locks.discard((ms.model_id, ms.signal.symbol))
+                all_model_ids = set(task_model_ids)
                 await asyncio.to_thread(
                     lambda: [self._refresh_model_state(mid, self._models[mid]) for mid in all_model_ids if mid in self._models]
                 )
@@ -503,13 +531,21 @@ class Arena:
             self._adapt_bar_count += n_bars
             self._set_status("session", f"Session {self._session_number} trading", bar=self._bar_count)
 
-        # Set time remaining on each bar (needed for check_liquidation even on synthetic)
+        # Set time remaining on each bar (needed for check_liquidation even on synthetic).
+        # In live mode, anchor to market close minus buffer (3:58 PM ET).
         if self._session_start_time:
             session_mins = self._current_session_minutes or self.config.arena.session_1_minutes
             elapsed = self._session_elapsed_minutes()
-            base_remaining = max(0.0, session_mins - elapsed)
-            market_remaining = self._minutes_until_market_close()
-            remaining = min(base_remaining, market_remaining)
+            session_remaining = max(0.0, session_mins - elapsed)
+            if not self.simulate:
+                buffer = self.config.arena.market_close_buffer_minutes
+                market_remaining = max(
+                    0.0,
+                    self._minutes_until_market_close() - buffer,
+                )
+                remaining = min(session_remaining, market_remaining)
+            else:
+                remaining = session_remaining
             for bar in bars:
                 bar.minutes_remaining = remaining
         else:
@@ -606,7 +642,7 @@ class Arena:
                 latest_prices[bar.symbol] = bar.close
             for model_id, strategy in self._models.items():
                 for symbol, qty in list(strategy._positions.items()):
-                    if qty <= 0 or symbol not in latest_prices:
+                    if qty < 0.001 or symbol not in latest_prices:
                         continue
                     # Skip if we already fired a stop/TP for this position
                     sl_key = (model_id, symbol)
@@ -617,37 +653,120 @@ class Arena:
                     if not entry_price or entry_price <= 0:
                         continue
                     pct_change = (price - entry_price) / entry_price * 100.0
+                    # Leverage-scaled exits: tighten thresholds proportionally
+                    # to position notional vs model budget. A 2x leveraged
+                    # position gets stops that are half as wide in % terms,
+                    # keeping dollar-risk constant.
+                    position_notional = qty * entry_price
+                    leverage = max(1.0, position_notional / strategy.initial_capital)
                     triggered = None
-                    if strategy.stop_loss_pct and pct_change <= -strategy.stop_loss_pct:
+                    eff_stop = strategy.stop_loss_pct / leverage if strategy.stop_loss_pct else None
+                    eff_tp = strategy.take_profit_pct / leverage if strategy.take_profit_pct else None
+                    if eff_stop and pct_change <= -eff_stop:
                         triggered = "stop_loss"
-                    elif strategy.take_profit_pct and pct_change >= strategy.take_profit_pct:
-                        triggered = "take_profit"
-                    else:
-                        # Trailing stop: track high-water mark and sell if price
-                        # drops trailing_stop_pct below the peak.
+                    elif eff_tp and pct_change >= eff_tp:
+                        # Instead of hard sell, activate trailing stop tiers
+                        if not strategy.trailing_stop_tiers:
+                            strategy.trailing_stop_tiers = [(3.0, 1.5), (6.0, 1.0), (10.0, 0.75)]
+                            logger.info(
+                                f"[TP->TRAIL] model {model_id} {symbol}: "
+                                f"gain={pct_change:+.2f}% hit TP, activating trailing stop"
+                            )
+                        # Don't trigger sell — trailing stop check below manages exit
+
+                    # Ratcheting trailing stop: runs independently of stop_loss/TP
+                    # so it fires even after TP activates trailing tiers.
+                    if not triggered and strategy.trailing_stop_tiers:
                         hwm_key = (model_id, symbol)
-                        if strategy.trailing_stop_pct and strategy.trailing_stop_activation_pct:
-                            hwm = self._high_water_mark.get(hwm_key, entry_price)
-                            if price > hwm:
-                                self._high_water_mark[hwm_key] = price
-                                hwm = price
-                            gain_from_entry = (hwm - entry_price) / entry_price * 100.0
-                            if gain_from_entry >= strategy.trailing_stop_activation_pct:
-                                drop_from_peak = (hwm - price) / hwm * 100.0
-                                if drop_from_peak >= strategy.trailing_stop_pct:
-                                    triggered = "trailing_stop"
+                        hwm = self._high_water_mark.get(hwm_key, entry_price)
+                        if price > hwm:
+                            self._high_water_mark[hwm_key] = price
+                            hwm = price
+                        gain_from_entry = (hwm - entry_price) / entry_price * 100.0
+                        # Scale gain threshold DOWN by leverage so trailing
+                        # activates sooner on leveraged positions
+                        active_trail = strategy.get_active_trail_pct(gain_from_entry * leverage)
+                        if active_trail is not None:
+                            drop_from_peak = (hwm - price) / hwm * 100.0
+                            # Scale trail distance DOWN by leverage
+                            if drop_from_peak >= active_trail / leverage:
+                                triggered = "trailing_stop"
+                    # Profit stagnation exit: position is profitable but going nowhere.
+                    # Activate when +0.5% to <TP and price is flat for 15+ bars.
+                    if not triggered and pct_change >= 0.5 and (not eff_tp or pct_change < eff_tp):
+                        stag_key = (model_id, symbol)
+                        # Check if price is flat: (max-min)/entry < 0.2% over last 10 bars
+                        sym_history = strategy.get_history(symbol, lookback=10)
+                        if len(sym_history) >= 5:
+                            recent_highs = [b.high for b in sym_history]
+                            recent_lows = [b.low for b in sym_history]
+                            price_range = (max(recent_highs) - min(recent_lows)) / entry_price
+                            recent_volumes = [b.volume for b in sym_history]
+                            avg_vol_all = sum(b.volume for b in strategy.get_history(symbol, lookback=50)) / max(1, len(strategy.get_history(symbol, lookback=50)))
+                            vol_ratio = (sum(recent_volumes) / len(recent_volumes)) / avg_vol_all if avg_vol_all > 0 else 1.0
+                            # Tighten threshold after 25 bars stagnant
+                            bars_stag = self._stagnation_bars.get(stag_key, 0)
+                            flat_threshold = 0.001 if bars_stag >= 25 else 0.002
+                            is_flat = price_range < flat_threshold and vol_ratio < 0.8
+                            if is_flat:
+                                self._stagnation_bars[stag_key] = bars_stag + 1
+                                if self._stagnation_bars[stag_key] >= 15:
+                                    triggered = "profit_stagnation"
+                            else:
+                                # Reset if price makes new move or drops below +0.5%
+                                self._stagnation_bars.pop(stag_key, None)
+                        # Also reset if hwm changed significantly (new high)
+                        hwm_key = (model_id, symbol)
+                        hwm = self._high_water_mark.get(hwm_key, entry_price)
+                        if price > hwm:
+                            self._stagnation_bars.pop(stag_key, None)
+                    elif pct_change < 0.5:
+                        # Below +0.5% — not in stagnation zone
+                        self._stagnation_bars.pop((model_id, symbol), None)
+
+                    # Patience stop: track consecutive bars underwater, tighten
+                    # exit as patience runs out. Resets when position goes green.
+                    if not triggered and strategy.patience_stop_tiers:
+                        uw_key = (model_id, symbol)
+                        if pct_change < 0:
+                            self._bars_underwater[uw_key] = self._bars_underwater.get(uw_key, 0) + 1
+                            bars_uw = self._bars_underwater[uw_key]
+                            patience_exit = strategy.get_patience_exit_pct(bars_uw)
+                            # Scale patience exit threshold by leverage (less negative = tighter)
+                            if patience_exit is not None and pct_change <= patience_exit / leverage:
+                                triggered = "patience_stop"
+                        else:
+                            # Position is green — reset counter
+                            self._bars_underwater.pop(uw_key, None)
                     if triggered:
-                        signal = TradeSignal(symbol=symbol, side="sell", quantity=qty)
+                        signal = TradeSignal(symbol=symbol, side="sell", quantity=qty, reason=triggered)
                         liquidation_signals.append(
                             (model_id, signal, strategy.current_capital)
                         )
                         self._stop_loss_fired.add(sl_key)
-                        # Clean up high-water mark on exit
+                        # Build log extras before cleanup
+                        extra = ""
+                        if triggered == "trailing_stop":
+                            hwm_val = self._high_water_mark.get((model_id, symbol), price)
+                            trail_val = strategy.get_active_trail_pct(
+                                (hwm_val - entry_price) / entry_price * 100.0
+                            )
+                            extra = f" HWM={hwm_val:.2f} trail={trail_val}%"
+                        elif triggered == "patience_stop":
+                            bars_uw = self._bars_underwater.get((model_id, symbol), 0)
+                            patience_exit = strategy.get_patience_exit_pct(bars_uw)
+                            extra = f" bars_underwater={bars_uw} patience_exit={patience_exit}%"
+                        elif triggered == "profit_stagnation":
+                            bars_stag = self._stagnation_bars.get((model_id, symbol), 0)
+                            extra = f" stagnation_bars={bars_stag}"
+                        # Clean up tracking state on exit
                         self._high_water_mark.pop((model_id, symbol), None)
+                        self._bars_underwater.pop((model_id, symbol), None)
+                        self._stagnation_bars.pop((model_id, symbol), None)
                         logger.info(
                             f"[{triggered.upper()}] model {model_id} {symbol}: "
-                            f"entry={entry_price:.2f} now={price:.2f} ({pct_change:+.2f}%) "
-                            f"-> selling {qty}"
+                            f"entry={entry_price:.2f} now={price:.2f} ({pct_change:+.2f}%)"
+                            f"{extra} -> selling {qty}"
                         )
 
             # NOTE: position manager state update moved to AFTER capital
@@ -662,43 +781,59 @@ class Arena:
         for model_id, amount in pre_deducted.items():
             self._models[model_id].current_capital += amount
 
-        # Update position manager with true capital (after restoration)
+        # Update position manager portfolio state for drawdown circuit breaker
         self._update_position_manager_state_cached(
             self._cached_positioned_symbols
         )
 
-        # Resolve conflicting signals
-        resolved_orders = self.position_manager.resolve(model_signals)
+        # Independent model trading: submit each model's order directly
+        # Group signals by symbol to detect and log disagreements
+        by_symbol: dict[str, list[ModelSignal]] = defaultdict(list)
+        for ms in model_signals:
+            by_symbol[ms.signal.symbol].append(ms)
 
-        if resolved_orders:
+        # Build ordered task list: sells first per symbol, then buys
+        async_tasks = []
+        task_model_ids: list[int] = []  # track model_id per task for refresh
+
+        for symbol, sym_signals in by_symbol.items():
+            buys = [ms for ms in sym_signals if ms.signal.side == "buy"]
+            sells = [ms for ms in sym_signals if ms.signal.side == "sell"]
+
+            # Log disagreements
+            if buys and sells:
+                logger.info(
+                    f"[SIGNAL_CONFLICT] {symbol}: {len(buys)} buys vs {len(sells)} sells"
+                )
+
+            # Submit sells first (exits are priority), then buys
+            for ms in sells + buys:
+                lock_key = (ms.model_id, ms.signal.symbol)
+                if lock_key in self._model_symbol_locks:
+                    continue
+                self._model_symbol_locks.add(lock_key)
+                # Pre-deduct capital for buys so concurrent orders see reduced balance
+                if ms.signal.side == "buy":
+                    est_price = self.execution._last_prices.get(ms.signal.symbol, 100)
+                    self._models[ms.model_id].current_capital -= ms.signal.quantity * est_price
+                async_tasks.append(
+                    self.execution.async_submit_order(
+                        model_id=ms.model_id,
+                        signal=ms.signal,
+                        current_capital=self._models[ms.model_id].current_capital,
+                        session_date=session_date,
+                    )
+                )
+                task_model_ids.append(ms.model_id)
+
+        if model_signals:
             logger.info(
                 f"Batch ({n_bars} bars): {len(model_signals)} signals -> "
-                f"{len(resolved_orders)} resolved orders"
+                f"{len(async_tasks)} independent orders"
             )
 
-        # Submit resolved orders (live mode — batch callbacks only used in live)
-        async_tasks = []
-        for order in resolved_orders:
-            primary_model = max(order.contributing_models, key=lambda x: x[1])[0]
-            signal = TradeSignal(
-                symbol=order.symbol, side=order.side, quantity=order.quantity
-            )
-            self.position_manager.lock_symbol(order.symbol)
-            # Pre-deduct capital so subsequent orders in this batch see reduced
-            # balance for risk checks. _refresh_model_state() after gather
-            # overwrites in-memory capital from DB, so this is transient.
-            if signal.side == "buy":
-                est_price = self.execution._last_prices.get(order.symbol, 100)
-                self._models[primary_model].current_capital -= signal.quantity * est_price
-            async_tasks.append(
-                self.execution.async_submit_order(
-                    model_id=primary_model,
-                    signal=signal,
-                    current_capital=self._models[primary_model].current_capital,
-                    session_date=session_date,
-                )
-            )
-
+        # Liquidation signals (stop-loss, trailing stop, patience stop)
+        n_regular = len(async_tasks)
         for mid, sig, cap in liquidation_signals:
             async_tasks.append(
                 self.execution.async_submit_order(
@@ -706,23 +841,21 @@ class Arena:
                     current_capital=cap, session_date=session_date,
                 )
             )
+            task_model_ids.append(mid)
 
         if async_tasks:
             logger.info(f"[BATCH-DBG] submitting {len(async_tasks)} orders via gather...")
             results = await asyncio.gather(*async_tasks, return_exceptions=True)
-            # Log any exceptions from order submission
             for i, r in enumerate(results):
                 if isinstance(r, Exception):
                     logger.error(f"[BATCH-DBG] order task {i} failed: {r!r}")
-            # Clear _stop_loss_fired for liquidation signals that failed to submit,
-            # so they can re-trigger on the next bar batch. Exits are critical.
-            n_resolved = len(resolved_orders)
+            # Clear _stop_loss_fired for liquidation signals that failed
             for j, (mid, sig, _cap) in enumerate(liquidation_signals):
-                result_idx = n_resolved + j
+                result_idx = n_regular + j
                 if result_idx < len(results):
                     r = results[result_idx]
                     failed = isinstance(r, Exception) or r is None or (
-                        hasattr(r, 'status') and r.status.value == 'rejected'
+                        hasattr(r, 'status') and getattr(r.status, 'value', None) == 'rejected'
                     )
                     if failed:
                         sl_key = (mid, sig.symbol)
@@ -731,13 +864,11 @@ class Arena:
                             f"[SL/TP RETRY] Cleared stop_loss_fired for model {mid} "
                             f"{sig.symbol} — will re-trigger next bar"
                         )
-            logger.info(f"[BATCH-DBG] gather done, unlocking symbols...")
-            for order in resolved_orders:
-                self.position_manager.unlock_symbol(order.symbol)
-            all_model_ids = set(
-                [max(o.contributing_models, key=lambda x: x[1])[0] for o in resolved_orders]
-                + [mid for mid, _, _ in liquidation_signals]
-            )
+            # Unlock per-model symbol locks
+            logger.info(f"[BATCH-DBG] gather done, unlocking model-symbol locks...")
+            for ms in model_signals:
+                self._model_symbol_locks.discard((ms.model_id, ms.signal.symbol))
+            all_model_ids = set(task_model_ids)
             logger.info(f"[BATCH-DBG] refreshing {len(all_model_ids)} model states...")
             await asyncio.to_thread(
                 lambda: [self._refresh_model_state(mid, self._models[mid]) for mid in all_model_ids if mid in self._models]
@@ -783,6 +914,7 @@ class Arena:
                     self.tracker.set_last_prices(last_prices)
                     self.tracker.update_all()
                     self.tracker.save_snapshots(session_date, session_number)
+                    self._save_daily_ledger()  # keep history page live
 
                 logger.info("[BATCH-DBG] saving snapshot...")
                 await asyncio.to_thread(_snapshot)
@@ -861,8 +993,8 @@ class Arena:
             positions = db.query(Position).filter(
                 Position.model_id == model_id, Position.quantity > 0
             ).all()
-            strategy._positions = {p.symbol: p.quantity for p in positions}
-            strategy._entry_prices = {p.symbol: p.avg_entry_price for p in positions if p.avg_entry_price > 0}
+            strategy._positions = {p.symbol: p.quantity for p in positions if p.quantity >= 0.001}
+            strategy._entry_prices = {p.symbol: p.avg_entry_price for p in positions if p.quantity >= 0.001 and p.avg_entry_price > 0}
         finally:
             db.close()
 
@@ -921,10 +1053,10 @@ class Arena:
             # Update all strategies
             for model_id, strategy in self._models.items():
                 model_positions = pos_by_model.get(model_id, [])
-                strategy._positions = {p.symbol: p.quantity for p in model_positions}
+                strategy._positions = {p.symbol: p.quantity for p in model_positions if p.quantity >= 0.001}
                 strategy._entry_prices = {
                     p.symbol: p.avg_entry_price
-                    for p in model_positions if p.avg_entry_price > 0
+                    for p in model_positions if p.quantity >= 0.001 and p.avg_entry_price > 0
                 }
 
             return positioned_symbols
@@ -1205,11 +1337,15 @@ class Arena:
                 # Clear stop-loss fired flag on buy (new position can trigger fresh)
                 # or on sell (position gone, flag no longer needed)
                 self._stop_loss_fired.discard((model_id, symbol))
-                # Reset high-water mark on sell (position closed) or buy (new entry)
+                # Reset tracking state on sell (position closed) or buy (new entry)
                 if side == "sell":
                     self._high_water_mark.pop((model_id, symbol), None)
+                    self._bars_underwater.pop((model_id, symbol), None)
+                    self._stagnation_bars.pop((model_id, symbol), None)
                 elif side == "buy":
                     self._high_water_mark[(model_id, symbol)] = price
+                    self._bars_underwater.pop((model_id, symbol), None)
+                    self._stagnation_bars.pop((model_id, symbol), None)
 
                 # Track fill for intra-session adaptation
                 entry_price = self._models[model_id]._entry_prices.get(symbol, price)
@@ -1220,12 +1356,8 @@ class Arena:
                 }
                 self._recent_fills.setdefault(model_id, []).append(fill_record)
 
-                # Score signal outcome for PositionManager weighting
-                if side == "sell" and pnl != 0:
-                    self.position_manager.record_signal_outcome(model_id, win=(pnl > 0))
-
-            # Unlock symbol in position manager
-            self.position_manager.unlock_symbol(symbol)
+            # Unlock per-model symbol lock
+            self._model_symbol_locks.discard((model_id, symbol))
 
         elif result["type"] == "reject":
             model_id = result["model_id"]
@@ -1236,27 +1368,206 @@ class Arena:
 
     def _end_session_liquidate_sync(self) -> None:
         """Force-close remaining positions (sync version for backtest/offline)."""
+        import time as _time
         logger.info("EOD liquidation: closing remaining positions")
         closed = self.execution.liquidate_all(self._session_date)
-        alpaca_closed = self.execution.liquidate_all_alpaca()
+        if closed and not self.simulate:
+            _time.sleep(2)
+        alpaca_closed = self.execution.liquidate_all_alpaca(self._session_date)
         if alpaca_closed:
-            logger.info(f"Alpaca hard liquidation closed {alpaca_closed} extra positions")
+            logger.info(f"Alpaca safety net closed {alpaca_closed} extra positions")
+
+        # Verify-and-retry loop (same logic as async version)
+        if not self.simulate:
+            for attempt in range(1, 5):
+                _time.sleep(2)
+                try:
+                    positions = self.execution.client.get_all_positions()
+                    real = [p for p in positions if abs(float(p.qty)) >= 0.001]
+                    if not real:
+                        logger.info("EOD liquidation verified: Alpaca is flat")
+                        break
+                    logger.warning(
+                        f"EOD verify {attempt}/4: {len(real)} positions still open"
+                    )
+                    self.execution.client.close_all_positions(cancel_orders=True)
+                    _time.sleep(2)
+                    for p in self.execution.client.get_all_positions():
+                        if abs(float(p.qty)) >= 0.001:
+                            try:
+                                self.execution.client.close_position(p.symbol)
+                            except Exception:
+                                pass
+                except Exception:
+                    logger.warning(f"EOD verify attempt {attempt} failed", exc_info=True)
+
         if closed or alpaca_closed:
             self.tracker.update_all()
 
     async def _end_session_liquidate(self) -> None:
-        """Force-close remaining positions without blocking the event loop."""
+        """Force-close remaining positions without blocking the event loop.
+
+        Uses a verify-and-retry loop to ensure Alpaca is fully flat.
+        Leftover positions from failed EOD liquidation is the #1 bug source.
+        """
         logger.info("EOD liquidation: closing remaining positions")
+
+        # Phase 1: close via our tracked order flow (gets realized_pnl)
         closed = await asyncio.to_thread(
             self.execution.liquidate_all, self._session_date
         )
+        if closed and not self.simulate:
+            await asyncio.sleep(2)
+
+        # Phase 2: Alpaca safety net for anything our DB missed
         alpaca_closed = await asyncio.to_thread(
-            self.execution.liquidate_all_alpaca
+            self.execution.liquidate_all_alpaca, self._session_date
         )
         if alpaca_closed:
-            logger.info(f"Alpaca hard liquidation closed {alpaca_closed} extra positions")
+            logger.info(f"Alpaca safety net closed {alpaca_closed} extra positions")
+
+        # Phase 3: verify-and-retry loop — keep going until Alpaca is flat
+        if not self.simulate:
+            MAX_VERIFY = 4
+            for attempt in range(1, MAX_VERIFY + 1):
+                await asyncio.sleep(2)
+                try:
+                    positions = await asyncio.to_thread(
+                        self.execution.client.get_all_positions
+                    )
+                    real = [p for p in positions if abs(float(p.qty)) >= 0.001]
+                    if not real:
+                        logger.info(
+                            f"EOD liquidation verified: Alpaca is flat"
+                            f"{f' after {attempt} verification(s)' if attempt > 1 else ''}"
+                        )
+                        break
+
+                    logger.warning(
+                        f"EOD verify {attempt}/{MAX_VERIFY}: {len(real)} positions "
+                        f"still open ({', '.join(f'{p.symbol}={float(p.qty):.4f}' for p in real[:8])})"
+                    )
+
+                    # Brute force: close_all_positions then individual closes
+                    try:
+                        await asyncio.to_thread(
+                            self.execution.client.close_all_positions,
+                            cancel_orders=True,
+                        )
+                    except Exception:
+                        pass
+                    await asyncio.sleep(2)
+
+                    # Individual close for stubborn positions
+                    remaining = await asyncio.to_thread(
+                        self.execution.client.get_all_positions
+                    )
+                    for p in remaining:
+                        if abs(float(p.qty)) < 0.001:
+                            continue
+                        try:
+                            await asyncio.to_thread(
+                                self.execution.client.close_position, p.symbol
+                            )
+                        except Exception:
+                            logger.debug(f"EOD: failed to close {p.symbol}", exc_info=True)
+                except Exception:
+                    logger.warning(f"EOD verify attempt {attempt} failed", exc_info=True)
+            else:
+                # All attempts exhausted
+                try:
+                    final = await asyncio.to_thread(
+                        self.execution.client.get_all_positions
+                    )
+                    final_real = [p for p in final if abs(float(p.qty)) >= 0.001]
+                    if final_real:
+                        symbols = [f"{p.symbol}={float(p.qty):.4f}" for p in final_real]
+                        logger.error(
+                            f"EOD LIQUIDATION INCOMPLETE: {len(final_real)} positions "
+                            f"survived: {symbols}. Startup cleanup will retry."
+                        )
+                except Exception:
+                    pass
+
+            # Phase 4: Extended-hours limit sells for anything still open
+            # Market orders submitted during Phase 1-3 may sit ACCEPTED after
+            # 4:00 PM close, leaving positions exposed overnight.  Cancel those
+            # stuck orders and resubmit as extended-hours limit sells.
+            try:
+                stragglers = await asyncio.to_thread(
+                    self.execution.client.get_all_positions
+                )
+                straggler_real = [
+                    p for p in stragglers if abs(float(p.qty)) >= 0.001
+                ]
+                if straggler_real:
+                    logger.warning(
+                        f"Phase 4 (extended-hours): {len(straggler_real)} "
+                        f"positions still open after Phase 3"
+                    )
+                    # Cancel all open orders (clears stuck market sells)
+                    try:
+                        await asyncio.to_thread(
+                            self.execution.client.cancel_orders
+                        )
+                        logger.info("Phase 4: cancelled all open orders")
+                        await asyncio.sleep(1)
+                    except Exception as e:
+                        logger.warning(f"Phase 4: cancel_orders failed: {e}")
+
+                    ext_submitted = 0
+                    ext_skipped = 0
+                    for p in straggler_real:
+                        qty = abs(float(p.qty))
+                        price = float(p.current_price)
+                        if qty >= 1.0:
+                            order_id = await asyncio.to_thread(
+                                self.execution.submit_extended_hours_sell,
+                                p.symbol,
+                                qty,
+                                price,
+                            )
+                            if order_id:
+                                ext_submitted += 1
+                        else:
+                            logger.info(
+                                f"Phase 4: {p.symbol} qty={qty:.4f} is "
+                                f"fractional — will close at next market open"
+                            )
+                            ext_skipped += 1
+                    logger.info(
+                        f"Phase 4 (extended-hours) complete: "
+                        f"{ext_submitted} limit sells submitted, "
+                        f"{ext_skipped} fractional skipped"
+                    )
+            except Exception:
+                logger.warning(
+                    "Phase 4 (extended-hours) failed", exc_info=True
+                )
+
         if closed or alpaca_closed:
             self.tracker.update_all()
+
+    async def _get_alpaca_pnl(self) -> float | None:
+        """Query Alpaca account for real daily P&L (equity - last_equity).
+
+        Returns None if simulating or on error.
+        """
+        if self.simulate:
+            return None
+        try:
+            acct = await asyncio.to_thread(self.execution.client.get_account)
+            equity = float(acct.equity)
+            last_equity = float(acct.last_equity)
+            pnl = round(equity - last_equity, 2)
+            logger.info(
+                f"Alpaca account: equity=${equity:.2f}, "
+                f"last_equity=${last_equity:.2f}, day_pnl=${pnl:+.2f}"
+            )
+            return pnl
+        except Exception as e:
+            logger.warning(f"Failed to query Alpaca account P&L: {e}")
+            return None
 
     def _run_screener(self) -> list[str]:
         """Run the symbol screener to expand the trading universe.
@@ -1355,6 +1666,195 @@ class Arena:
 
             # Warm up strategies with historical data for new symbols
             await asyncio.to_thread(self._warmup_symbols, new_symbols)
+
+    async def _health_check(self) -> dict:
+        """Run health checks on data flow, subscriptions, sell path, and model state.
+
+        Returns a results dict and stores it in self._last_health_check.
+        Purely observational — never blocks or kills the session.
+        """
+        import time as _time
+
+        results: dict = {
+            "timestamp": datetime.now(ET).isoformat(),
+            "checks": {},
+            "warnings": [],
+            "errors": [],
+        }
+
+        # --- 1a. Data flow verification ---
+        data_flow = {"ok": True, "last_bar_time": None, "bar_symbols": []}
+        if hasattr(self.feed, "_last_bar_time") and self.feed._last_bar_time:
+            from datetime import timezone
+            last_bar = self.feed._last_bar_time
+            data_flow["last_bar_time"] = last_bar.isoformat()
+            age_sec = (datetime.now(timezone.utc) - last_bar).total_seconds()
+            if age_sec > 60:
+                data_flow["ok"] = False
+                msg = f"No bar received in {age_sec:.0f}s (last: {last_bar.isoformat()})"
+                results["warnings"].append(msg)
+                logger.warning(f"[HEALTH] Data flow: {msg}")
+            else:
+                logger.info(f"[HEALTH] Data flow: OK (last bar {age_sec:.0f}s ago)")
+        elif self._bar_count > 0:
+            logger.info("[HEALTH] Data flow: OK (bars received, no timestamp tracking)")
+        else:
+            data_flow["ok"] = False
+            msg = "No bars received yet"
+            results["warnings"].append(msg)
+            logger.warning(f"[HEALTH] Data flow: {msg}")
+
+        # Check core symbols in subscribed bars
+        core = {"AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "JPM", "V", "SPY"}
+        subscribed = getattr(self.feed, "_subscribed_bars", set())
+        data_flow["subscribed_count"] = len(subscribed)
+        missing_core = core - subscribed
+        if missing_core:
+            msg = f"Core symbols not subscribed: {sorted(missing_core)}"
+            results["warnings"].append(msg)
+            logger.warning(f"[HEALTH] {msg}")
+        data_flow["missing_core"] = sorted(missing_core) if missing_core else []
+        results["checks"]["data_flow"] = data_flow
+
+        # --- 1b. Subscription integrity ---
+        sub_check = {"ok": True, "gaps": [], "auto_fixed": []}
+        positioned = await asyncio.to_thread(self._get_positioned_symbols)
+        sub_check["positioned_count"] = len(positioned)
+        gaps = positioned - subscribed
+        if gaps:
+            sub_check["ok"] = False
+            sub_check["gaps"] = sorted(gaps)
+            msg = f"Position symbols not subscribed for bars: {sorted(gaps)}"
+            results["warnings"].append(msg)
+            logger.warning(f"[HEALTH] Subscription gap: {msg}")
+            # Auto-fix: subscribe to missing symbols
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(self.feed.subscribe_bars, sorted(gaps)),
+                    timeout=10.0,
+                )
+                sub_check["auto_fixed"] = sorted(gaps)
+                logger.info(f"[HEALTH] Auto-subscribed to {sorted(gaps)}")
+            except Exception as e:
+                logger.error(f"[HEALTH] Failed to auto-subscribe: {e!r}")
+        else:
+            logger.info(f"[HEALTH] Subscriptions: OK ({len(positioned)} positioned, {len(subscribed)} subscribed)")
+        results["checks"]["subscriptions"] = sub_check
+
+        # --- 1c. Sell path smoke test ---
+        sell_path = {"ok": True, "blocked_at": None}
+        dummy_signal = TradeSignal(symbol="__HEALTH_CHECK__", side="sell", quantity=0)
+        try:
+            # Walk through the sell guards in submit_order manually
+            blocked = None
+            # Guard 1: min quantity (qty=0 < 0.001 — this SHOULD block)
+            # We test with qty=1 to get past min qty
+            dummy_signal_test = TradeSignal(symbol="__HEALTH_CHECK__", side="sell", quantity=1.0)
+
+            # Guard 2: circuit breaker — only blocks buys, should pass sells
+            # (we don't need a real model_id, just check the logic)
+            if dummy_signal_test.side == "buy" and 0 in self.execution._daily_loss_breached:
+                blocked = "circuit_breaker"
+
+            # Guard 3: wash trade cooldown — only blocks buys
+            if not blocked and dummy_signal_test.side == "buy":
+                blocked = "wash_trade_cooldown"
+
+            # Guard 4: risk limits — check_risk_limits only blocks buys
+            # (sell path doesn't raise RiskLimitExceeded)
+
+            if blocked:
+                sell_path["ok"] = False
+                sell_path["blocked_at"] = blocked
+                msg = f"Sell path BLOCKED at {blocked}"
+                results["errors"].append(msg)
+                logger.error(f"[HEALTH] {msg}")
+            else:
+                logger.info("[HEALTH] Sell path: OK (all guards pass sells)")
+        except Exception as e:
+            sell_path["ok"] = False
+            sell_path["blocked_at"] = f"exception: {e!r}"
+            logger.error(f"[HEALTH] Sell path check exception: {e!r}")
+        results["checks"]["sell_path"] = sell_path
+
+        # --- 1d. Model state sanity ---
+        model_check = {"ok": True, "warnings": [], "zero_trade_models": []}
+        for model_id, strategy in self._models.items():
+            record = self._model_records.get(model_id)
+            name = record.name if record else f"model_{model_id}"
+
+            # Negative capital with positions
+            if strategy.current_capital < 0 and any(q > 0 for q in strategy._positions.values()):
+                msg = f"{name}: negative capital ({strategy.current_capital:.2f}) with open positions"
+                model_check["warnings"].append(msg)
+                results["errors"].append(msg)
+                logger.error(f"[HEALTH] {msg}")
+
+            # Check in-memory positions vs DB
+            db_positions = {}
+            try:
+                from src.core.database import Position
+                db = get_session(self.config.db_path)
+                try:
+                    rows = db.query(Position).filter(
+                        Position.model_id == model_id, Position.quantity > 0.001
+                    ).all()
+                    db_positions = {r.symbol: r.quantity for r in rows}
+                finally:
+                    db.close()
+            except Exception:
+                pass
+
+            mem_positions = {s: q for s, q in strategy._positions.items() if q > 0.001}
+            if set(mem_positions.keys()) != set(db_positions.keys()):
+                mem_only = set(mem_positions.keys()) - set(db_positions.keys())
+                db_only = set(db_positions.keys()) - set(mem_positions.keys())
+                msg = f"{name}: position mismatch (mem_only={sorted(mem_only)}, db_only={sorted(db_only)})"
+                model_check["warnings"].append(msg)
+                results["warnings"].append(msg)
+                logger.warning(f"[HEALTH] {msg}")
+
+        # Zero-trade models (info level)
+        if self._bar_count > 50:
+            for model_id, strategy in self._models.items():
+                record = self._model_records.get(model_id)
+                name = record.name if record else f"model_{model_id}"
+                metrics = self.tracker._metrics.get(model_id)
+                trades = metrics.total_trades if metrics else 0
+                if trades == 0:
+                    model_check["zero_trade_models"].append(name)
+            if model_check["zero_trade_models"]:
+                logger.info(
+                    f"[HEALTH] Models with 0 trades after {self._bar_count} bars: "
+                    f"{model_check['zero_trade_models']}"
+                )
+
+        if model_check["warnings"]:
+            model_check["ok"] = False
+        results["checks"]["model_state"] = model_check
+
+        # Overall status
+        all_ok = all(c.get("ok", True) for c in results["checks"].values())
+        results["overall"] = "OK" if all_ok else "DEGRADED"
+        logger.info(f"[HEALTH] Overall: {results['overall']} ({len(results['warnings'])} warnings, {len(results['errors'])} errors)")
+
+        self._last_health_check = results
+        return results
+
+    async def _periodic_health_check(self) -> None:
+        """Run health checks periodically during a session."""
+        interval = self._health_check_interval_minutes
+        if interval <= 0:
+            return
+
+        while self._running:
+            await asyncio.sleep(interval * 60)
+            if not self._running:
+                break
+            try:
+                await self._health_check()
+            except Exception:
+                logger.exception("[HEALTH] Periodic health check failed (non-fatal)")
 
     def _warmup_strategies(self) -> None:
         """Feed recent historical bars through strategies without placing orders.
@@ -1836,6 +2336,12 @@ class Arena:
                     new_params["stop_loss_pct"] = getattr(strategy, "stop_loss_pct", 2.0)
                 if "take_profit_pct" not in new_params:
                     new_params["take_profit_pct"] = getattr(strategy, "take_profit_pct", 3.0)
+                # Inject trailing stop tiers for CFA visibility
+                if strategy.trailing_stop_tiers:
+                    new_params["trailing_stop_tiers"] = [list(t) for t in strategy.trailing_stop_tiers]
+                # Inject patience stop tiers for CFA visibility
+                if strategy.patience_stop_tiers:
+                    new_params["patience_stop_tiers"] = [list(t) for t in strategy.patience_stop_tiers]
 
                 # Strategies that lost money get stronger mutations
                 if metrics.return_pct < 0:
@@ -1854,6 +2360,54 @@ class Arena:
                 # Get CFA recs for this model (by name)
                 model_cfa_recs = (cfa_recommendations or {}).get(metrics.model_name, {})
                 cfa_applied_count = 0
+
+                # Handle trailing_stop_tiers CFA rec before the numeric loop
+                tiers_rec = model_cfa_recs.pop("trailing_stop_tiers", None)
+                if tiers_rec and isinstance(tiers_rec.get("value"), list):
+                    try:
+                        raw_tiers = tiers_rec["value"]
+                        validated = []
+                        for pair in raw_tiers:
+                            if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                                gain = max(0.1, min(20.0, float(pair[0])))
+                                trail = max(0.1, min(10.0, float(pair[1])))
+                                validated.append((gain, trail))
+                        if validated:
+                            validated.sort(key=lambda t: t[0])
+                            new_params["trailing_stop_tiers"] = [list(t) for t in validated]
+                            strategy.trailing_stop_tiers = validated
+                            cfa_applied_count += 1
+                            logger.info(
+                                f"  CFA-guided [{tiers_rec.get('confidence', '?')}] "
+                                f"{metrics.model_name}.trailing_stop_tiers: {validated} "
+                                f"(rationale={tiers_rec.get('rationale', '')[:80]})"
+                            )
+                    except (TypeError, ValueError) as e:
+                        logger.warning(f"Invalid CFA trailing_stop_tiers for {metrics.model_name}: {e}")
+
+                # Handle patience_stop_tiers CFA rec before the numeric loop
+                patience_rec = model_cfa_recs.pop("patience_stop_tiers", None)
+                if patience_rec and isinstance(patience_rec.get("value"), list):
+                    try:
+                        raw_tiers = patience_rec["value"]
+                        validated = []
+                        for pair in raw_tiers:
+                            if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                                bars = max(1, min(120, int(pair[0])))
+                                exit_pct = max(-10.0, min(-0.05, float(pair[1])))
+                                validated.append((bars, exit_pct))
+                        if validated:
+                            validated.sort(key=lambda t: t[0])
+                            new_params["patience_stop_tiers"] = [list(t) for t in validated]
+                            strategy.patience_stop_tiers = validated
+                            cfa_applied_count += 1
+                            logger.info(
+                                f"  CFA-guided [{patience_rec.get('confidence', '?')}] "
+                                f"{metrics.model_name}.patience_stop_tiers: {validated} "
+                                f"(rationale={patience_rec.get('rationale', '')[:80]})"
+                            )
+                    except (TypeError, ValueError) as e:
+                        logger.warning(f"Invalid CFA patience_stop_tiers for {metrics.model_name}: {e}")
 
                 for key, value in new_params.items():
                     if not isinstance(value, (int, float)):
@@ -1917,6 +2471,22 @@ class Arena:
                     strategy.stop_loss_pct = max(0.5, min(10.0, float(new_params["stop_loss_pct"])))
                 if "take_profit_pct" in new_params:
                     strategy.take_profit_pct = max(0.5, min(15.0, float(new_params["take_profit_pct"])))
+                # Apply trailing_stop_tiers back to base class (already validated above)
+                if "trailing_stop_tiers" in new_params and isinstance(new_params["trailing_stop_tiers"], list):
+                    try:
+                        tiers = [(float(t[0]), float(t[1])) for t in new_params["trailing_stop_tiers"]]
+                        tiers.sort(key=lambda t: t[0])
+                        strategy.trailing_stop_tiers = tiers
+                    except (TypeError, IndexError, ValueError):
+                        pass
+                # Apply patience_stop_tiers back to base class (already validated above)
+                if "patience_stop_tiers" in new_params and isinstance(new_params["patience_stop_tiers"], list):
+                    try:
+                        tiers = [(int(t[0]), float(t[1])) for t in new_params["patience_stop_tiers"]]
+                        tiers.sort(key=lambda t: t[0])
+                        strategy.patience_stop_tiers = tiers
+                    except (TypeError, IndexError, ValueError):
+                        pass
 
                 # Generate LLM watch rules (skip COLLAB)
                 if (
@@ -2123,8 +2693,15 @@ class Arena:
             logger.info(f"Session {session_number} time limit reached ({session_minutes} min)")
             await self.feed.stop_streaming()
 
+        # Run initial health check before trading starts
+        try:
+            await self._health_check()
+        except Exception:
+            logger.exception("[HEALTH] Initial health check failed (non-fatal)")
+
         timer_task = asyncio.create_task(_session_timer())
         screener_task = asyncio.create_task(self._periodic_screener())
+        health_task = asyncio.create_task(self._periodic_health_check())
         try:
             # Start aggregator timer before streaming so it's ready for quotes
             if self._quote_aggregator:
@@ -2142,7 +2719,7 @@ class Arena:
             # Let timer_task finish naturally (it called stop_streaming) to avoid
             # cancelling SDK close mid-flight, which leaves streams half-closed and
             # causes the second stop_streaming call below to hang (freeze bug #3).
-            for task in (timer_task, screener_task):
+            for task in (timer_task, screener_task, health_task):
                 if not task.done():
                     try:
                         await asyncio.wait_for(asyncio.shield(task), timeout=10.0)
@@ -2162,6 +2739,17 @@ class Arena:
 
         # EOD liquidation: force-close remaining positions
         await self._end_session_liquidate()
+
+        # Let Alpaca settle fills from close_all_positions() before reconciling
+        if not self.simulate:
+            await asyncio.sleep(3)
+            recon = await asyncio.to_thread(
+                self.execution.reconcile_fills_with_alpaca, self._session_date
+            )
+            logger.info(f"Post-session fill reconciliation: {recon}")
+
+        # Query Alpaca account for real P&L (equity vs last_equity)
+        alpaca_pnl = await self._get_alpaca_pnl()
 
         # Final performance update
         self.tracker.update_all()
@@ -2188,8 +2776,11 @@ class Arena:
                     m.total_trades
                     for m in self.tracker.get_leaderboard()
                 )
+                session_record.alpaca_pnl = alpaca_pnl
                 session_record.summary = summary
                 db.commit()
+                if alpaca_pnl is not None:
+                    logger.info(f"Session {session_number} Alpaca real P&L: ${alpaca_pnl:+.2f}")
         finally:
             db.close()
 
@@ -2197,7 +2788,11 @@ class Arena:
         return summary
 
     def _reset_all_capital(self) -> None:
-        """Reset all active models to initial capital, clear positions and stale orders."""
+        """Reset all active models to initial capital, clear positions and stale orders.
+
+        Always does a full reset. For same-day resume (preserving capital +
+        positions), use run_custom(resume=True) which skips this method entirely.
+        """
         from src.core.database import Order, OrderStatus, Position
         db = get_session(self.config.db_path)
         try:
@@ -2213,16 +2808,17 @@ class Arena:
             deleted_count = db.query(Position).delete()
             if deleted_count:
                 logger.info(f"Deleted {deleted_count} position rows (fresh start)")
-            # Resolve stale PENDING orders from prior sessions
+            logger.info(
+                f"Reset {len(models)} models to ${self.config.arena.initial_capital:,.2f}"
+            )
+
+            # Always resolve stale PENDING orders from prior sessions
             stale = db.query(Order).filter(Order.status == OrderStatus.PENDING).update(
                 {Order.status: OrderStatus.REJECTED, Order.rejected_reason: "stale (reset)"}
             )
             if stale:
                 logger.info(f"Cleaned {stale} stale PENDING orders")
             db.commit()
-            logger.info(
-                f"Reset {len(models)} models to ${self.config.arena.initial_capital:,.2f}"
-            )
         finally:
             db.close()
 
@@ -2241,25 +2837,80 @@ class Arena:
         self._instantiate_strategies(models)
 
     def _clean_alpaca_state(self) -> None:
-        """Cancel all open orders and close positions on Alpaca before starting fresh."""
-        import time as _time
-        try:
-            cancelled = self.execution.client.cancel_orders()
-            if cancelled:
-                logger.info(f"Startup cleanup: cancelled {len(cancelled)} stale Alpaca orders")
-                _time.sleep(1)
+        """Cancel all open orders and close ALL positions on Alpaca before starting.
 
-            positions = self.execution.client.get_all_positions()
-            if positions:
-                logger.info(f"Startup cleanup: closing {len(positions)} stale Alpaca positions")
-                self.execution.client.close_all_positions(cancel_orders=True)
-                _time.sleep(2)
-                # Verify
+        Retries in a verify loop until Alpaca reports zero non-dust positions.
+        This MUST succeed — leftover positions corrupt the next session.
+        """
+        import time as _time
+        MAX_ATTEMPTS = 5
+
+        try:
+            # Always cancel pending orders first
+            try:
+                cancelled = self.execution.client.cancel_orders()
+                if cancelled:
+                    logger.info(f"Startup cleanup: cancelled {len(cancelled)} stale Alpaca orders")
+                    _time.sleep(1)
+            except Exception:
+                logger.warning("Startup cleanup: failed to cancel orders", exc_info=True)
+
+            for attempt in range(1, MAX_ATTEMPTS + 1):
+                positions = self.execution.client.get_all_positions()
+                real = [p for p in positions if abs(float(p.qty)) >= 0.001]
+                if not real:
+                    if attempt == 1 and not positions:
+                        logger.info("Startup cleanup: Alpaca account is clean")
+                    else:
+                        logger.info(
+                            f"Startup cleanup: all positions closed after "
+                            f"{attempt} attempt(s)"
+                        )
+                    return
+
+                logger.info(
+                    f"Startup cleanup attempt {attempt}/{MAX_ATTEMPTS}: "
+                    f"{len(real)} positions to close "
+                    f"({', '.join(f'{p.symbol}={float(p.qty):.4f}' for p in real[:10])})"
+                )
+
+                # Try bulk close first
+                try:
+                    self.execution.client.close_all_positions(cancel_orders=True)
+                    _time.sleep(3)
+                except Exception:
+                    logger.warning("Startup cleanup: close_all_positions failed", exc_info=True)
+
+                # Individually close anything that survived
                 remaining = self.execution.client.get_all_positions()
-                if remaining:
-                    logger.warning(f"Startup cleanup: {len(remaining)} positions still open after close attempt")
+                for p in remaining:
+                    qty = abs(float(p.qty))
+                    if qty < 0.001:
+                        continue
+                    try:
+                        self.execution.client.close_position(p.symbol)
+                        logger.info(f"Startup cleanup: individually closed {p.symbol} qty={qty:.6f}")
+                    except Exception:
+                        logger.warning(
+                            f"Startup cleanup: failed to close {p.symbol} qty={qty:.6f}",
+                            exc_info=True,
+                        )
+                _time.sleep(2)
+
+            # Final check after all attempts
+            final = self.execution.client.get_all_positions()
+            final_real = [p for p in final if abs(float(p.qty)) >= 0.001]
+            if final_real:
+                symbols = [f"{p.symbol}={float(p.qty):.4f}" for p in final_real]
+                logger.error(
+                    f"STARTUP CLEANUP FAILED: {len(final_real)} positions still open "
+                    f"after {MAX_ATTEMPTS} attempts: {symbols}. "
+                    f"These WILL interfere with trading."
+                )
+            else:
+                logger.info(f"Startup cleanup: all positions closed after {MAX_ATTEMPTS} attempts")
         except Exception as e:
-            logger.warning(f"Startup cleanup failed (non-fatal): {e}")
+            logger.error(f"Startup cleanup CRITICAL error: {e}", exc_info=True)
 
     async def run(self) -> None:
         """Run the full trading day:
@@ -2377,17 +3028,30 @@ class Arena:
             self._running = True
             loop = asyncio.get_running_loop()
             loop.set_default_executor(ThreadPoolExecutor(max_workers=32))
+
+            # Clean stale PENDING orders but preserve capital + positions
+            from src.core.database import Order, OrderStatus
+            db = get_session(self.config.db_path)
+            try:
+                stale = db.query(Order).filter(
+                    Order.status == OrderStatus.PENDING
+                ).update({
+                    Order.status: OrderStatus.REJECTED,
+                    Order.rejected_reason: "stale (resume)",
+                })
+                if stale:
+                    logger.info(f"Resume: cleaned {stale} stale PENDING orders")
+                db.commit()
+            finally:
+                db.close()
+
             models = self._load_or_create_models()
             self._instantiate_strategies(models)
 
-            # Reconcile DB positions with Alpaca before restoring state
-            recon = await asyncio.to_thread(
-                self.execution.reconcile_positions_with_alpaca
-            )
-            if recon.get("zeroed") or recon.get("adjusted"):
-                logger.info("Resume: reconciliation cleaned up stale positions")
-
-            # Restore positions + capital from DB (positions survive across restarts)
+            # Restore positions + capital from DB as-is (DB is authoritative
+            # for same-day resume — reconciliation would incorrectly credit
+            # capital back for positions sold by other models in the shared
+            # Alpaca account)
             for model_id, strategy in self._models.items():
                 self._refresh_model_state(model_id, strategy)
             # Log restored state

@@ -28,16 +28,18 @@ LEVERAGED_ETF_BLOCKLIST: set[str] = {
     "QLD", "QID", "SSO", "SDS", "UDOW", "SDOW", "UVXY", "SVXY",
     # Direxion
     "TNA", "TZA", "LABU", "LABD", "FAS", "FAZ", "NUGT", "DUST",
-    "TECL", "TECS", "SPXL", "SPXS", "FNGU", "FNGD",
+    "TECL", "TECS", "SPXL", "SPXS", "FNGU", "FNGD", "DRIP", "GUSH",
+    # ProShares commodity inverse
+    "SCO", "UCO", "BOIL", "KOLD",
     # Volatility
     "UVIX", "SVIX", "VXX", "VIXY",
-    # Crypto-linked
-    "BITO", "BITI",
+    # Crypto-linked / Bitcoin ETFs
+    "BITO", "BITI", "IBIT", "GBTC", "FBTC", "ARKB", "BTCW", "HODL", "BITB",
     # Other inverse
     "SH", "PSQ", "DOG", "RWM",
     # Single-stock leveraged ETFs (correlated duplicates of core symbols)
     "NVD", "NVDL", "NVDS",  # NVDA leveraged
-    "TSLL", "TSLQ",          # TSLA leveraged
+    "TSLL", "TSLQ", "TSLG", # TSLA leveraged
     "MSTU", "MSTZ",          # MSTR leveraged
     "CONL",                   # COIN leveraged
 }
@@ -99,6 +101,87 @@ class SymbolScreener:
             f"(from {len(candidates)} candidates, min_price=${cfg.screener_min_price})"
         )
         return result
+
+    def screen_with_snapshots(self) -> tuple[list[str], dict]:
+        """Like screen(), but also returns the raw Alpaca snapshot dict.
+
+        Returns:
+            (filtered_symbols, snapshots_dict) where snapshots_dict maps
+            symbol -> Alpaca Snapshot object.  Arena uses the daily_bar
+            inside each snapshot to seed DailyContext for screener additions.
+        """
+        cfg = self.config.arena
+        max_add = cfg.screener_max_additions
+        existing = set(cfg.symbols)
+
+        try:
+            actives = self._screener.get_most_actives(
+                MostActivesRequest(by=MostActivesBy.VOLUME, top=100)
+            )
+            candidates = [
+                s.symbol for s in actives.most_actives
+                if s.symbol not in existing
+                and s.symbol not in LEVERAGED_ETF_BLOCKLIST
+            ]
+            logger.info(
+                f"Screener: {len(actives.most_actives)} most-active fetched, "
+                f"{len(candidates)} new candidates"
+            )
+        except Exception:
+            logger.exception("Screener: failed to fetch most-actives")
+            return [], {}
+
+        if not candidates:
+            logger.info("Screener: no new candidates found")
+            return [], {}
+
+        filtered, snapshots = self._filter_by_price_with_snapshots(
+            candidates, cfg.screener_min_price,
+        )
+        result = filtered[:max_add]
+        logger.info(
+            f"Screener: {len(result)} symbols passed "
+            f"(from {len(candidates)} candidates, min_price=${cfg.screener_min_price})"
+        )
+        return result, snapshots
+
+    def _filter_by_price_with_snapshots(
+        self, symbols: list[str], min_price: float
+    ) -> tuple[list[str], dict]:
+        """Like _filter_by_price but also returns the raw snapshot dict."""
+        if not symbols or min_price <= 0:
+            return symbols, {}
+
+        try:
+            snapshots = self._historical.get_stock_snapshot(
+                StockSnapshotRequest(
+                    symbol_or_symbols=symbols,
+                    feed=DataFeed.SIP,
+                )
+            )
+            passed: list[str] = []
+            for sym in symbols:
+                snap = snapshots.get(sym)
+                if not snap:
+                    continue
+                price = (
+                    float(snap.latest_trade.price)
+                    if snap.latest_trade
+                    else 0.0
+                )
+                if price >= min_price:
+                    passed.append(sym)
+                else:
+                    logger.debug(
+                        f"Screener: {sym} filtered out "
+                        f"(price=${price:.2f} < ${min_price})"
+                    )
+            return passed, snapshots
+        except Exception:
+            logger.exception(
+                "Screener: snapshot price filter failed, keeping all candidates"
+            )
+            return symbols, {}
 
     def _filter_by_price(
         self, symbols: list[str], min_price: float

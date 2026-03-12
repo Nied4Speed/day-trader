@@ -37,8 +37,8 @@ from src.core.mutation_memory import MutationMemory
 from src.core.watch_rules import INDICATOR_CATALOG
 from src.core.performance import PerformanceTracker
 from src.core.position_manager import ModelSignal, PositionManager
-from src.core.regime import RegimeDetector
-from src.core.strategy import BarData, Strategy, TradeSignal, WatchSignal
+from src.core.regime import RegimeDetector, MacroRegimeOverlay
+from src.core.strategy import BarData, DailyContext, Strategy, TradeSignal, WatchSignal
 from src.data.feed import AlpacaDataFeed, QuoteAggregator
 from src.data.news_feed import AlpacaNewsFeed
 from src.data.screener import SymbolScreener
@@ -75,6 +75,7 @@ class Arena:
         self.position_manager = PositionManager()
         # Regime Detector: detects trending/ranging/volatility per symbol
         self.regime_detector = RegimeDetector()
+        self.macro_regime = MacroRegimeOverlay()
         # Adaptation tracking
         self._adapt_bar_count: int = 0
         self._adapt_interval: int = 15  # adapt every 15 bars
@@ -96,7 +97,12 @@ class Arena:
         self._bars_underwater: dict[tuple[int, str], int] = {}
         # Stagnation bar counter for profit stagnation exits: (model_id, symbol) -> consecutive flat bars
         self._stagnation_bars: dict[tuple[int, str], int] = {}
+        # Breakeven stop: once a position goes green by 0.3%, lock floor at entry.
+        # If price drops back to entry, sell. "Never let green go red."
+        self._breakeven_activated: set[tuple[int, str]] = set()
         self._watch_stats: dict[str, int] = {"created": 0, "expired": 0, "converted": 0}
+        # Daily context per symbol: daily_open, running_high, running_low, VWAP accumulators, prev_close
+        self._daily_context: dict[str, dict] = {}  # symbol -> {open, high, low, vwap_pv, vwap_vol, prev_close}
         # Quote aggregator for synthetic bars (created per session)
         self._quote_aggregator: Optional[QuoteAggregator] = None
         # Health check state
@@ -278,6 +284,11 @@ class Arena:
             self._models[model.id] = strategy
             self._model_records[model.id] = model
 
+        # Register per-model capital with execution handler for risk checks
+        self.execution._model_initial_capital = {
+            mid: s.initial_capital for mid, s in self._models.items()
+        }
+
         logger.info(f"Instantiated {len(self._models)} strategy instances")
 
     def _minutes_until_market_close(self) -> float:
@@ -427,6 +438,7 @@ class Arena:
                     signal=ms.signal,
                     current_capital=strategy.current_capital,
                     session_date=session_date,
+                    strategy_qty=strategy._positions.get(ms.signal.symbol, 0),
                 )
                 self._refresh_model_state(ms.model_id, strategy)
         else:
@@ -444,6 +456,7 @@ class Arena:
                         signal=ms.signal,
                         current_capital=self._models[ms.model_id].current_capital,
                         session_date=session_date,
+                        strategy_qty=self._models[ms.model_id]._positions.get(ms.signal.symbol, 0),
                     )
                 )
                 task_model_ids.append(ms.model_id)
@@ -453,6 +466,7 @@ class Arena:
                     self.execution.async_submit_order(
                         model_id=mid, signal=sig,
                         current_capital=cap, session_date=session_date,
+                        strategy_qty=self._models[mid]._positions.get(sig.symbol, 0) if mid in self._models else 0,
                     )
                 )
                 task_model_ids.append(mid)
@@ -579,6 +593,9 @@ class Arena:
             else:
                 bar.regime = self.regime_detector.update(bar)
 
+        # Update running daily context and attach to each bar
+        self._update_and_attach_daily_context(bars)
+
         # Collect signals from all bars × all models in one thread call
         model_signals: list[ModelSignal] = []
         liquidation_signals: list[tuple[int, TradeSignal, float]] = []
@@ -591,12 +608,31 @@ class Arena:
             positioned_symbols = self._refresh_all_models_batch()
             self._cached_positioned_symbols = positioned_symbols
 
+            # --- Macro regime overlay: update with SPY bars BEFORE signals ---
+            for bar in bars:
+                if bar.symbol == "SPY":
+                    self.macro_regime.update(bar)
+            self.macro_regime.tick_transition()
+            macro = self.macro_regime.multipliers
+
+            # --- Emergency override: portfolio daily P&L < -1% ---
+            total_initial = len(self._models) * self.config.arena.initial_capital
+            total_daily_pnl = sum(self.execution._daily_pnl.values())
+            if total_initial > 0:
+                daily_pnl_pct = total_daily_pnl / total_initial * 100.0
+                self.macro_regime.set_emergency_bear(daily_pnl_pct < -1.0)
+                if self.macro_regime._emergency_bear:
+                    macro = self.macro_regime.multipliers  # re-fetch after override
+
             for bar in bars:
                 for model_id, strategy in self._models.items():
                     try:
                         signal = strategy.on_bar(bar)
                         if signal and signal.quantity > 0:
                             if signal.symbol == "__SKIP__":
+                                continue
+                            # --- Macro buy gate: block new buys in STRONG_BEAR ---
+                            if signal.side == "buy" and not macro.buy_gate_open:
                                 continue
                             if (
                                 bar.minutes_remaining is not None
@@ -607,6 +643,11 @@ class Arena:
                                     (model_id, signal, strategy.current_capital)
                                 )
                             else:
+                                # Scale buy quantity by macro allocation multiplier
+                                if signal.side == "buy" and macro.allocation < 1.0:
+                                    signal.quantity = round(signal.quantity * macro.allocation, 4)
+                                    if signal.quantity < 0.01:
+                                        continue  # too small after scaling
                                 model_signals.append(
                                     ModelSignal(
                                         model_id=model_id,
@@ -660,7 +701,9 @@ class Arena:
                     position_notional = qty * entry_price
                     leverage = max(1.0, position_notional / strategy.initial_capital)
                     triggered = None
-                    eff_stop = strategy.stop_loss_pct / leverage if strategy.stop_loss_pct else None
+                    # Apply macro regime multiplier to stop loss
+                    base_stop = strategy.stop_loss_pct if strategy.stop_loss_pct else None
+                    eff_stop = (base_stop * macro.stop_loss) / leverage if base_stop else None
                     eff_tp = strategy.take_profit_pct / leverage if strategy.take_profit_pct else None
                     if eff_stop and pct_change <= -eff_stop:
                         triggered = "stop_loss"
@@ -688,9 +731,28 @@ class Arena:
                         active_trail = strategy.get_active_trail_pct(gain_from_entry * leverage)
                         if active_trail is not None:
                             drop_from_peak = (hwm - price) / hwm * 100.0
+                            # Apply macro regime multiplier to trail distance
+                            adjusted_trail = active_trail * macro.trailing_trail
                             # Scale trail distance DOWN by leverage
-                            if drop_from_peak >= active_trail / leverage:
+                            if drop_from_peak >= adjusted_trail / leverage:
                                 triggered = "trailing_stop"
+
+                    # Breakeven stop: "never let green go red."
+                    # Thresholds adjusted by macro regime.
+                    BREAKEVEN_ACTIVATE_PCT = macro.breakeven_activate_pct
+                    BREAKEVEN_FLOOR_PCT = macro.breakeven_floor_pct
+                    if not triggered:
+                        be_key = (model_id, symbol)
+                        if be_key in self._breakeven_activated:
+                            if pct_change <= BREAKEVEN_FLOOR_PCT:
+                                triggered = "breakeven_stop"
+                        elif pct_change >= BREAKEVEN_ACTIVATE_PCT:
+                            self._breakeven_activated.add(be_key)
+                            logger.info(
+                                f"[BREAKEVEN] model {model_id} {symbol}: "
+                                f"activated at {pct_change:+.2f}% — floor locked at +{BREAKEVEN_FLOOR_PCT}%"
+                            )
+
                     # Profit stagnation exit: position is profitable but going nowhere.
                     # Activate when +0.5% to <TP and price is flat for 15+ bars.
                     if not triggered and pct_change >= 0.5 and (not eff_tp or pct_change < eff_tp):
@@ -726,12 +788,16 @@ class Arena:
 
                     # Patience stop: track consecutive bars underwater, tighten
                     # exit as patience runs out. Resets when position goes green.
+                    # Macro regime scales patience: lower multiplier = less patience = exits sooner.
                     if not triggered and strategy.patience_stop_tiers:
                         uw_key = (model_id, symbol)
                         if pct_change < 0:
                             self._bars_underwater[uw_key] = self._bars_underwater.get(uw_key, 0) + 1
                             bars_uw = self._bars_underwater[uw_key]
-                            patience_exit = strategy.get_patience_exit_pct(bars_uw)
+                            # Scale bars_underwater UP when macro.patience_bars < 1 so
+                            # patience runs out faster in bearish regimes.
+                            adjusted_bars_uw = int(bars_uw / macro.patience_bars) if macro.patience_bars > 0 else bars_uw
+                            patience_exit = strategy.get_patience_exit_pct(adjusted_bars_uw)
                             # Scale patience exit threshold by leverage (less negative = tighter)
                             if patience_exit is not None and pct_change <= patience_exit / leverage:
                                 triggered = "patience_stop"
@@ -763,6 +829,7 @@ class Arena:
                         self._high_water_mark.pop((model_id, symbol), None)
                         self._bars_underwater.pop((model_id, symbol), None)
                         self._stagnation_bars.pop((model_id, symbol), None)
+                        self._breakeven_activated.discard((model_id, symbol))
                         logger.info(
                             f"[{triggered.upper()}] model {model_id} {symbol}: "
                             f"entry={entry_price:.2f} now={price:.2f} ({pct_change:+.2f}%)"
@@ -822,6 +889,7 @@ class Arena:
                         signal=ms.signal,
                         current_capital=self._models[ms.model_id].current_capital,
                         session_date=session_date,
+                        strategy_qty=self._models[ms.model_id]._positions.get(ms.signal.symbol, 0),
                     )
                 )
                 task_model_ids.append(ms.model_id)
@@ -839,6 +907,7 @@ class Arena:
                 self.execution.async_submit_order(
                     model_id=mid, signal=sig,
                     current_capital=cap, session_date=session_date,
+                    strategy_qty=self._models[mid]._positions.get(sig.symbol, 0) if mid in self._models else 0,
                 )
             )
             task_model_ids.append(mid)
@@ -1235,6 +1304,7 @@ class Arena:
                         signal=signal,
                         current_capital=strategy.current_capital,
                         session_date=session_date,
+                        strategy_qty=qty,
                     )
                     self._refresh_model_state(model_id, strategy)
 
@@ -1342,6 +1412,7 @@ class Arena:
                     self._high_water_mark.pop((model_id, symbol), None)
                     self._bars_underwater.pop((model_id, symbol), None)
                     self._stagnation_bars.pop((model_id, symbol), None)
+                    self._breakeven_activated.discard((model_id, symbol))
                 elif side == "buy":
                     self._high_water_mark[(model_id, symbol)] = price
                     self._bars_underwater.pop((model_id, symbol), None)
@@ -1574,6 +1645,7 @@ class Arena:
 
         Queries Alpaca for top most-active stocks by volume, applies a price
         floor, and extends ``self.config.arena.symbols`` with the results.
+        Also seeds daily context from snapshot data for new symbols.
         Safe to call multiple times (deduplicates).  Returns the list of
         newly added symbols (empty on failure or no new finds).
         """
@@ -1582,7 +1654,7 @@ class Arena:
 
         try:
             screener = SymbolScreener(self.config)
-            new_symbols = screener.screen()
+            new_symbols, snapshots = screener.screen_with_snapshots()
             if new_symbols:
                 existing = set(self.config.arena.symbols)
                 to_add = [s for s in new_symbols if s not in existing]
@@ -1592,6 +1664,9 @@ class Arena:
                         f"Screener added {len(to_add)} symbols: {to_add} "
                         f"(total: {len(self.config.arena.symbols)})"
                     )
+                    # Seed daily context from snapshots for newly added symbols
+                    if snapshots:
+                        self._seed_daily_context_from_snapshots(snapshots)
                     return to_add
             else:
                 logger.info("Screener returned no new symbols")
@@ -1856,6 +1931,211 @@ class Arena:
             except Exception:
                 logger.exception("[HEALTH] Periodic health check failed (non-fatal)")
 
+    # ── Daily context tracking ───────────────────────────────────────────
+
+    def _seed_daily_context_from_warmup(self) -> None:
+        """Derive daily context from warmup bars already in strategy history.
+
+        Scans any strategy's _bar_history for today's bars (>= 9:30 AM ET)
+        to find daily open, running high/low, cumulative VWAP, and yesterday's
+        close per symbol.
+        """
+        today = datetime.now(ET).date()
+        market_open_dt = datetime.combine(today, MARKET_OPEN, tzinfo=ET)
+
+        # Grab bar history from the first strategy that has one
+        sample_strategy = next(iter(self._models.values()), None)
+        if not sample_strategy or not hasattr(sample_strategy, '_bar_history'):
+            logger.info("Daily context: no bar history available after warmup")
+            return
+
+        # Collect all bars by symbol from history
+        bars_by_symbol: dict[str, list[BarData]] = {}
+        for bar in sample_strategy._bar_history:
+            bars_by_symbol.setdefault(bar.symbol, []).append(bar)
+
+        seeded = 0
+        for symbol, bars in bars_by_symbol.items():
+            bars.sort(key=lambda b: b.timestamp)
+
+            # Find yesterday's close (last bar before today's open)
+            prev_close = None
+            for bar in reversed(bars):
+                bar_dt = bar.timestamp.to_pydatetime()
+                if hasattr(bar_dt, 'tzinfo') and bar_dt.tzinfo is None:
+                    bar_dt = bar_dt.replace(tzinfo=ET)
+                if bar_dt < market_open_dt:
+                    prev_close = bar.close
+                    break
+
+            # Filter to today's market-hours bars only
+            today_bars = []
+            for bar in bars:
+                bar_dt = bar.timestamp.to_pydatetime()
+                if hasattr(bar_dt, 'tzinfo') and bar_dt.tzinfo is None:
+                    bar_dt = bar_dt.replace(tzinfo=ET)
+                if bar_dt >= market_open_dt:
+                    today_bars.append(bar)
+
+            if not today_bars:
+                # No today bars yet (pre-market) — still store prev_close if available
+                if prev_close is not None:
+                    self._daily_context[symbol] = {
+                        "open": None,
+                        "high": None,
+                        "low": None,
+                        "vwap_pv": 0.0,
+                        "vwap_vol": 0,
+                        "prev_close": prev_close,
+                    }
+                continue
+
+            first = today_bars[0]
+            high = max(b.high for b in today_bars)
+            low = min(b.low for b in today_bars)
+            vwap_pv = sum(
+                ((b.high + b.low + b.close) / 3.0) * b.volume for b in today_bars
+            )
+            vwap_vol = sum(b.volume for b in today_bars)
+
+            self._daily_context[symbol] = {
+                "open": first.open,
+                "high": high,
+                "low": low,
+                "vwap_pv": vwap_pv,
+                "vwap_vol": vwap_vol,
+                "prev_close": prev_close,
+            }
+            seeded += 1
+
+        logger.info(f"Daily context seeded for {seeded} symbols from warmup bars")
+
+    def _seed_daily_context_from_snapshots(self, snapshots: dict) -> None:
+        """Seed daily context from Alpaca snapshot objects (screener additions).
+
+        Each snapshot has ``daily_bar`` (open/high/low/close/volume/vwap) and
+        ``previous_daily_bar`` (for prev_close).
+        """
+        seeded = 0
+        for symbol, snap in snapshots.items():
+            if symbol in self._daily_context:
+                continue  # don't overwrite existing context
+
+            daily = getattr(snap, 'daily_bar', None)
+            if not daily:
+                continue
+
+            prev_daily = getattr(snap, 'previous_daily_bar', None)
+            prev_close = float(prev_daily.close) if prev_daily and hasattr(prev_daily, 'close') else None
+            vwap = float(daily.vwap) if hasattr(daily, 'vwap') and daily.vwap else 0.0
+            volume = int(daily.volume) if hasattr(daily, 'volume') and daily.volume else 0
+
+            self._daily_context[symbol] = {
+                "open": float(daily.open),
+                "high": float(daily.high),
+                "low": float(daily.low),
+                "vwap_pv": vwap * volume,  # reconstruct cumulative price*volume
+                "vwap_vol": volume,
+                "prev_close": prev_close,
+            }
+            seeded += 1
+
+        if seeded:
+            logger.info(f"Daily context seeded for {seeded} symbols from snapshots")
+
+    def _update_and_attach_daily_context(self, bars: list[BarData]) -> None:
+        """Update running high/low/VWAP from new bars and attach DailyContext to each."""
+        for bar in bars:
+            ctx = self._daily_context.get(bar.symbol)
+            if ctx is None:
+                # First time seeing this symbol — use this bar as the open
+                ctx = {
+                    "open": bar.open,
+                    "high": bar.high,
+                    "low": bar.low,
+                    "vwap_pv": ((bar.high + bar.low + bar.close) / 3.0) * bar.volume,
+                    "vwap_vol": bar.volume,
+                    "prev_close": None,
+                }
+                self._daily_context[bar.symbol] = ctx
+            elif ctx.get("open") is None:
+                # Had prev_close from warmup but no today bars yet
+                ctx["open"] = bar.open
+                ctx["high"] = bar.high
+                ctx["low"] = bar.low
+                ctx["vwap_pv"] = ((bar.high + bar.low + bar.close) / 3.0) * bar.volume
+                ctx["vwap_vol"] = bar.volume
+            else:
+                # Update running values
+                ctx["high"] = max(ctx["high"], bar.high)
+                ctx["low"] = min(ctx["low"], bar.low)
+                typical = (bar.high + bar.low + bar.close) / 3.0
+                ctx["vwap_pv"] += typical * bar.volume
+                ctx["vwap_vol"] += bar.volume
+
+            # Build DailyContext dataclass
+            daily_open = ctx["open"]
+            if daily_open is None:
+                continue  # shouldn't happen here, but guard
+
+            daily_range = ctx["high"] - ctx["low"]
+            vwap = ctx["vwap_pv"] / ctx["vwap_vol"] if ctx["vwap_vol"] > 0 else bar.close
+
+            change_from_open = (bar.close - daily_open) / daily_open * 100.0 if daily_open else 0.0
+            prev_close = ctx.get("prev_close")
+            change_from_prev = (
+                (bar.close - prev_close) / prev_close * 100.0
+                if prev_close
+                else None
+            )
+            range_pos = (
+                (bar.close - ctx["low"]) / daily_range
+                if daily_range > 0
+                else 0.5
+            )
+
+            bar.daily_context = DailyContext(
+                daily_open=daily_open,
+                running_high=ctx["high"],
+                running_low=ctx["low"],
+                daily_vwap=round(vwap, 4),
+                prev_close=prev_close,
+                change_from_open_pct=round(change_from_open, 4),
+                change_from_prev_close_pct=round(change_from_prev, 4) if change_from_prev is not None else None,
+                daily_range_position=round(range_pos, 4),
+            )
+
+        # Attach SPY's daily context to every bar as a market trend proxy
+        spy_ctx = self._daily_context.get("SPY")
+        if spy_ctx and spy_ctx.get("open") is not None:
+            # Find the latest SPY bar in this batch for current close price,
+            # otherwise use last known high as approximation
+            spy_close = None
+            for bar in reversed(bars):
+                if bar.symbol == "SPY":
+                    spy_close = bar.close
+                    break
+            if spy_close is None:
+                spy_close = spy_ctx["high"]  # best available approximation
+
+            spy_open = spy_ctx["open"]
+            spy_range = spy_ctx["high"] - spy_ctx["low"]
+            spy_vwap = spy_ctx["vwap_pv"] / spy_ctx["vwap_vol"] if spy_ctx["vwap_vol"] > 0 else spy_close
+            spy_prev = spy_ctx.get("prev_close")
+
+            spy_dc = DailyContext(
+                daily_open=spy_open,
+                running_high=spy_ctx["high"],
+                running_low=spy_ctx["low"],
+                daily_vwap=round(spy_vwap, 4),
+                prev_close=spy_prev,
+                change_from_open_pct=round((spy_close - spy_open) / spy_open * 100.0, 4) if spy_open else 0.0,
+                change_from_prev_close_pct=round((spy_close - spy_prev) / spy_prev * 100.0, 4) if spy_prev else None,
+                daily_range_position=round((spy_close - spy_ctx["low"]) / spy_range, 4) if spy_range > 0 else 0.5,
+            )
+            for bar in bars:
+                bar.spy_daily_context = spy_dc
+
     def _warmup_strategies(self) -> None:
         """Feed recent historical bars through strategies without placing orders.
 
@@ -1921,6 +2201,7 @@ class Arena:
         # Step 3: Historical warmup (existing behavior)
         self._set_status("warmup", f"Historical warmup ({cfg.warmup_bars} bars)")
         self._warmup_strategies()
+        self._seed_daily_context_from_warmup()
 
         # Step 3: Try fetching today's pre-market bars via SIP
         sip_available = True
@@ -2613,6 +2894,7 @@ class Arena:
         total_capital = sum(m.current_capital for m in models)
         self.position_manager.start_session(total_capital)
         self.regime_detector.reset()
+        self.macro_regime.reset()
         self._recent_signals.clear()
         self._recent_fills.clear()
 
@@ -2788,10 +3070,12 @@ class Arena:
         return summary
 
     def _reset_all_capital(self) -> None:
-        """Reset all active models to initial capital, clear positions and stale orders.
+        """Reset all active models to their initial capital, clear positions and stale orders.
 
-        Always does a full reset. For same-day resume (preserving capital +
-        positions), use run_custom(resume=True) which skips this method entirely.
+        Each model's current_capital is reset to its initial_capital (set by CFA
+        allocation). Models without a per-model allocation fall back to the
+        config default. For same-day resume (preserving capital + positions),
+        use run_custom(resume=True) which skips this method entirely.
         """
         from src.core.database import Order, OrderStatus, Position
         db = get_session(self.config.db_path)
@@ -2799,17 +3083,26 @@ class Arena:
             models = db.query(TradingModel).filter(
                 TradingModel.status == ModelStatus.ACTIVE
             ).all()
+            default_capital = self.config.arena.initial_capital
             for m in models:
-                m.current_capital = self.config.arena.initial_capital
-                m.initial_capital = self.config.arena.initial_capital
+                # Respect per-model allocation set by CFA review.
+                # Only fall back to config default if initial_capital is unset.
+                if m.initial_capital and m.initial_capital > 0:
+                    m.current_capital = m.initial_capital
+                else:
+                    m.current_capital = default_capital
+                    m.initial_capital = default_capital
             # DELETE all position rows (not just zero qty) to prevent stale
             # rows from being overwritten with Alpaca's account-wide qty during
             # reconciliation, which causes phantom position duplication.
             deleted_count = db.query(Position).delete()
             if deleted_count:
                 logger.info(f"Deleted {deleted_count} position rows (fresh start)")
+            total = sum(m.initial_capital for m in models)
             logger.info(
-                f"Reset {len(models)} models to ${self.config.arena.initial_capital:,.2f}"
+                f"Reset {len(models)} models — total pool ${total:,.0f} "
+                f"(range ${min(m.initial_capital for m in models):,.0f}–"
+                f"${max(m.initial_capital for m in models):,.0f})"
             )
 
             # Always resolve stale PENDING orders from prior sessions
@@ -2827,6 +3120,7 @@ class Arena:
         init_db(self.config.db_path)
         self._session_date = datetime.now(ET).strftime("%Y-%m-%d")
         self._running = True
+        self._daily_context.clear()  # fresh day context
 
         # Increase default thread pool to avoid exhaustion from DB + API calls
         loop = asyncio.get_running_loop()
@@ -3076,6 +3370,7 @@ class Arena:
         else:
             self._run_screener()
             self._warmup_strategies()
+            self._seed_daily_context_from_warmup()
 
         # Override configured session durations
         original_s1 = self.config.arena.session_1_minutes
@@ -3288,6 +3583,7 @@ class Arena:
         # Quick warmup
         logger.info("Step 2: Warmup...")
         self._warmup_strategies()
+        self._seed_daily_context_from_warmup()
 
         # Run a micro-session
         logger.info(f"Step 3: Starting {test_duration_min}-min streaming session...")
@@ -3307,6 +3603,7 @@ class Arena:
         total_capital = sum(m.current_capital for m in test_models)
         self.position_manager.start_session(total_capital)
         self.regime_detector.reset()
+        self.macro_regime.reset()
         self._recent_signals.clear()
         self._recent_fills.clear()
 
@@ -3426,6 +3723,7 @@ class Arena:
         self._prepare()
         self._run_screener()
         self._warmup_strategies()
+        self._seed_daily_context_from_warmup()
 
         try:
             summary = await self._run_session(session_number)

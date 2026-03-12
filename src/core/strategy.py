@@ -22,6 +22,30 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class DailyContext:
+    """Daily price anchors for a symbol — attached to each bar by the arena.
+
+    Strategies can use these to understand where the current price sits relative
+    to the day's range.  For screener-added symbols this is seeded from the
+    Alpaca snapshot; for core symbols it's derived from warmup bars.
+
+    Example usage in a strategy::
+
+        if bar.daily_context and bar.daily_context.change_from_open_pct < -5.0:
+            return None  # skip — stock is in freefall from open
+    """
+
+    daily_open: float
+    running_high: float
+    running_low: float
+    daily_vwap: float  # cumulative VWAP (sum(price*vol) / sum(vol))
+    prev_close: Optional[float] = None  # previous day's close, None if unknown
+    change_from_open_pct: float = 0.0  # (close - open) / open * 100
+    change_from_prev_close_pct: Optional[float] = None  # vs prev close
+    daily_range_position: float = 0.5  # 0.0 = at day low, 1.0 = at day high
+
+
+@dataclass
 class BarData:
     """A single completed OHLCV bar. Strategies never see in-progress bars."""
 
@@ -36,6 +60,8 @@ class BarData:
     news_sentiment: Optional[float] = None  # -1.0 to +1.0, None if unavailable
     regime: Optional[Any] = None  # RegimeState, set by arena before fan-out
     synthetic: bool = False  # True for bars aggregated from quote stream
+    daily_context: Optional[DailyContext] = None  # daily open/high/low/VWAP anchors
+    spy_daily_context: Optional[DailyContext] = None  # SPY context as market trend proxy
 
 
 @dataclass
@@ -64,6 +90,7 @@ class TradeSignal:
     limit_price: Optional[float] = None
     stop_loss_pct: Optional[float] = None  # e.g., 2.0 = 2% stop-loss
     take_profit_pct: Optional[float] = None  # e.g., 3.0 = 3% take-profit
+    reason: str = "model_decision"  # why this signal was generated
 
 
 class Strategy(ABC):
@@ -81,7 +108,7 @@ class Strategy(ABC):
     # Stop opening new positions when this many minutes remain
     NO_BUY_WINDOW: float = 10.0
     # Force-sell all positions when this many minutes remain
-    LIQUIDATION_WINDOW: float = 3.0
+    LIQUIDATION_WINDOW: float = 2.0
 
     def __init__(self, name: str, params: Optional[dict] = None):
         self.name = name
@@ -95,10 +122,26 @@ class Strategy(ABC):
         self.stop_loss_pct: Optional[float] = 2.0
         self.take_profit_pct: Optional[float] = 3.0
         # Trailing stop — disabled by default. CFA can enable per model.
-        # trailing_stop_pct: how far below the high-water mark to trigger (e.g., 1.5 = 1.5%)
-        # trailing_stop_activation_pct: minimum gain before trailing stop activates (e.g., 1.0 = 1%)
+        # Legacy fixed params (kept for backward compat, migrated to tiers on load):
         self.trailing_stop_pct: Optional[float] = None
         self.trailing_stop_activation_pct: Optional[float] = None
+        # Ratcheting trailing stop tiers: list of (gain_threshold_pct, trail_distance_pct)
+        # sorted ascending by gain. As gain grows, trail tightens.
+        # Example: [(1.0, 2.0), (3.0, 1.5), (5.0, 0.5)]
+        #   At +1% gain -> trail 2% below peak
+        #   At +3% gain -> trail 1.5% below peak
+        #   At +5% gain -> trail 0.5% below peak
+        # CFA-tunable only (not randomly mutated).
+        self.trailing_stop_tiers: list[tuple[float, float]] | None = None
+        # Patience stop tiers: list of (bars_underwater, exit_pct)
+        # sorted ascending by bars. As a losing position lingers, patience shrinks.
+        # Example: [(10, -1.8), (20, -1.3), (35, -0.8), (50, -0.3)]
+        #   After 10 bars underwater -> exit at -1.8%
+        #   After 20 bars underwater -> exit at -1.3%
+        #   After 50 bars underwater -> exit at -0.3% (just cut it)
+        # Counter resets to zero when position returns to positive P&L.
+        # CFA-tunable only (not randomly mutated).
+        self.patience_stop_tiers: list[tuple[int, float]] | None = None
         # LLM-generated watch rules (list of rule dicts)
         self._watch_rules: list[dict] = []
         # Cached indicator values per symbol, updated each on_bar()
@@ -108,16 +151,29 @@ class Strategy(ABC):
             # Load watch rules from params (set by LLM, not by set_params)
             self._watch_rules = params.get("_watch_rules", [])
 
-    def compute_quantity(self, price: float, allocation_pct: float = 0.25) -> float:
+    def compute_quantity(self, price: float, allocation_pct: float = 0.25, symbol: str | None = None) -> float:
         """Compute fractional shares to buy given price and desired capital allocation.
 
         Alpaca paper trading supports fractional shares for market orders.
         Returns at least 0.01 shares or $1 notional (whichever is larger),
         rounded to 4 decimal places.
+
+        Position-aware: when symbol is provided and an existing position exists,
+        tapers size to prevent accumulating oversized positions.
         """
         if price <= 0 or self.current_capital <= 0:
             return 0.0
         dollar_amount = self.current_capital * allocation_pct
+        # Position-aware tapering: cap per-symbol exposure
+        if symbol:
+            current_qty = self._positions.get(symbol, 0)
+            if current_qty > 0:
+                current_cost = current_qty * self._entry_prices.get(symbol, price)
+                max_single_exposure = self.initial_capital * allocation_pct
+                remaining = max(0.0, max_single_exposure - current_cost)
+                dollar_amount = min(dollar_amount, remaining)
+                if dollar_amount <= 0:
+                    return 0.0
         shares = dollar_amount / price
         # Minimum: max of 0.01 shares or $1 notional
         min_shares = max(0.01, 1.0 / price)
@@ -127,6 +183,35 @@ class Strategy(ABC):
                 return round(min_shares, 4)
             return 0.0
         return round(shares, 4)
+
+    def get_active_trail_pct(self, gain_from_entry_pct: float) -> float | None:
+        """Return the active trailing stop distance for the current gain level.
+
+        Walks tiers from highest gain threshold to lowest, returning the
+        trail_distance_pct for the first tier whose threshold is met.
+        Returns None if no tiers or gain hasn't reached the lowest tier.
+        """
+        if not self.trailing_stop_tiers:
+            return None
+        # Walk from highest tier down
+        for gain_threshold, trail_pct in reversed(self.trailing_stop_tiers):
+            if gain_from_entry_pct >= gain_threshold:
+                return trail_pct
+        return None
+
+    def get_patience_exit_pct(self, bars_underwater: int) -> float | None:
+        """Return the patience exit threshold for bars spent underwater.
+
+        Walks tiers from highest bar count to lowest, returning the
+        exit_pct for the first tier whose bar threshold is met.
+        Returns None if no tiers or not enough bars underwater yet.
+        """
+        if not self.patience_stop_tiers:
+            return None
+        for bar_threshold, exit_pct in reversed(self.patience_stop_tiers):
+            if bars_underwater >= bar_threshold:
+                return exit_pct
+        return None
 
     @abstractmethod
     def on_bar(self, bar: BarData) -> Optional[TradeSignal]:
@@ -223,7 +308,7 @@ class Strategy(ABC):
         mid = (bid + ask) / 2.0
         try:
             if evaluate_entry_condition(rule, mid, context):
-                qty = self.compute_quantity(mid)
+                qty = self.compute_quantity(mid, symbol=symbol)
                 if qty > 0:
                     return TradeSignal(symbol=symbol, side="buy", quantity=qty)
         except Exception as e:
@@ -254,12 +339,16 @@ class Strategy(ABC):
 
         pct_change = (mid - entry_price) / entry_price * 100.0
 
+        # Leverage-scaled exits: tighten thresholds for oversized positions
+        position_notional = qty * entry_price
+        leverage = max(1.0, position_notional / self.initial_capital)
+
         # Stop-loss: exit if price dropped below threshold
-        if self.stop_loss_pct and pct_change <= -self.stop_loss_pct:
+        if self.stop_loss_pct and pct_change <= -(self.stop_loss_pct / leverage):
             return TradeSignal(symbol=symbol, side="sell", quantity=qty)
 
         # Take-profit: exit if price rose above threshold
-        if self.take_profit_pct and pct_change >= self.take_profit_pct:
+        if self.take_profit_pct and pct_change >= (self.take_profit_pct / leverage):
             return TradeSignal(symbol=symbol, side="sell", quantity=qty)
 
         return None
@@ -282,7 +371,8 @@ class Strategy(ABC):
             qty = self._positions.get(bar.symbol, 0)
             if qty > 0:
                 return TradeSignal(
-                    symbol=bar.symbol, side="sell", quantity=qty
+                    symbol=bar.symbol, side="sell", quantity=qty,
+                    reason="liquidation_window",
                 )
             return TradeSignal(symbol="__SKIP__", side="sell", quantity=0)
 

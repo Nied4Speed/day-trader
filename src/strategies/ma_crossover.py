@@ -58,7 +58,7 @@ class MACrossoverStrategy(Strategy):
 
         # Golden cross: fast crosses above slow
         if prev_fast <= prev_slow and fast_ma > slow_ma:
-            qty = self.compute_quantity(bar.close, self.allocation_pct)
+            qty = self.compute_quantity(bar.close, self.allocation_pct, symbol=bar.symbol)
             if qty > 0:
                 return TradeSignal(symbol=bar.symbol, side="buy", quantity=qty)
 

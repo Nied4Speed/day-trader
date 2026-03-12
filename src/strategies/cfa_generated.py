@@ -1,362 +1,327 @@
-from src.core.strategy import Strategy, TradeSignal, BarData
-import pandas as pd
-import numpy as np
+"""CFA-Generated Macro-Aware Defensive VWAP Strategy.
+
+Shift from pure mean reversion to macro regime-aware defensive trading.
+Adds SPY trend filter and dramatically reduces position sizes to preserve
+capital in adverse market conditions.
+
+Key changes from previous version:
+1. Add SPY 5-minute trend filter to avoid counter-market trades
+2. Reduce allocation from 0.15 to 0.08 for defensive sizing
+3. Tighter fast profit (0.5%) and regime-aware stop loss adjustment
+"""
+
 import logging
-import math
+import pandas as pd
+from typing import Optional
+
+from src.core.strategy import BarData, Strategy, TradeSignal
+
+logger = logging.getLogger(__name__)
+
 
 class CfaGeneratedStrategy(Strategy):
-    """Multi-regime adaptive strategy using volume profile and momentum divergence.
-    
-    Key improvements from previous version:
-    1. Volume profile analysis to identify institutional activity
-    2. Regime detection to adapt to trending vs ranging markets  
-    3. Momentum divergence detection for high-probability reversals
-    4. Strict risk management with dynamic position sizing
-    5. Post-stop-loss cooldown to prevent re-entry bleeding
-    """
-    
     strategy_type = "cfa_generated"
-    
-    def __init__(self, name, params=None):
-        # Volume profile parameters
-        self.volume_lookback = 20  # Bars for volume analysis
-        self.volume_threshold = 1.5  # Institutional activity threshold
-        self.vwap_deviation = 0.002  # Distance from VWAP for mean reversion
-        
-        # Momentum parameters
-        self.fast_momentum = 5  # Fast momentum period
-        self.slow_momentum = 15  # Slow momentum period  
-        self.divergence_threshold = 0.003  # Momentum divergence threshold
-        
-        # Regime detection
-        self.atr_period = 10  # ATR for volatility regime
-        self.trend_period = 20  # Period for trend strength
-        self.regime_threshold = 0.6  # Trend strength threshold
-        
-        # Risk management
-        self.base_allocation = 0.20  # Base position size
-        self.max_positions = 3  # Maximum concurrent positions
-        self.stop_loss_pct = 1.5  # Tighter stop loss
-        self.take_profit_pct = 2.5  # Reasonable profit target
-        self.stop_cooldown_bars = 10  # Bars to wait after stop loss
-        
-        # Entry filters
-        self.min_price = 5.0  # Avoid penny stocks
-        self.min_volume = 1000000  # Minimum daily volume
-        self.min_bars = 30  # Minimum history required
-        
+
+    def __init__(self, name: str, params: Optional[dict] = None):
+        # VWAP deviation thresholds
+        self.vwap_deviation_threshold: float = 0.0015
+        self.max_deviation: float = 0.006
+
+        # Volume confirmation
+        self.volume_confirmation: float = 1.3
+        self.min_volume_ratio: float = 0.9
+
+        # Momentum and trend filters
+        self.momentum_window: int = 5
+        self.max_momentum_threshold: float = 0.015  # Tightened from 0.02
+        self.spy_trend_window: int = 5  # NEW: SPY trend filter
+
+        # Defensive position management
+        self.allocation_pct: float = 0.08  # Reduced from 0.15
+        self.max_positions: int = 6  # Reduced from 8
+        self.reversion_timeout: int = 8  # Faster timeout
+
+        # Faster profit target
+        self.fast_profit_pct: float = 0.5  # Reduced from 0.8
+
+        # Internal state
+        self._cumulative_vol: dict[str, float] = {}
+        self._cumulative_vp: dict[str, float] = {}
+        self._bars_since_entry: dict[str, int] = {}
+        self._volume_history: dict[str, list[float]] = {}
+        self._spy_history: list[float] = []  # NEW: SPY price history
+        self._adapt_wins: int = 0
+        self._adapt_total: int = 0
+
         super().__init__(name, params)
-        self.entry_prices = {}  # Track entry prices
-        self.stop_loss_triggered = {}  # Track stop losses by symbol
-        self.regime_state = {}  # Track regime by symbol
-    
-    def _calculate_vwap(self, bars):
-        """Calculate volume-weighted average price."""
-        if not bars:
+
+        # Regime-aware risk management
+        if not params or "stop_loss_pct" not in params:
+            self.stop_loss_pct = 1.2  # Tighter base stop
+        if not params or "take_profit_pct" not in params:
+            self.take_profit_pct = 1.8  # Lower target
+
+        # Tighter defensive stops
+        self.trailing_stop_tiers = [(0.5, 0.2), (1.2, 0.3)]
+        self.patience_stop_tiers = [(5, -0.4), (10, -0.2)]
+
+    def _get_vwap(self, symbol: str, bar: BarData) -> Optional[float]:
+        """Compute cumulative intraday VWAP from typical price * volume."""
+        typical_price = (bar.high + bar.low + bar.close) / 3.0
+        self._cumulative_vp[symbol] = (
+            self._cumulative_vp.get(symbol, 0.0) + typical_price * bar.volume
+        )
+        self._cumulative_vol[symbol] = (
+            self._cumulative_vol.get(symbol, 0.0) + bar.volume
+        )
+        if self._cumulative_vol[symbol] == 0:
             return None
+        return self._cumulative_vp[symbol] / self._cumulative_vol[symbol]
+
+    def _get_avg_volume(self, symbol: str) -> float:
+        """Return 20-bar average volume for the symbol."""
+        history = self._volume_history.get(symbol, [])
+        return sum(history) / len(history) if history else 0.0
+
+    def _update_volume_history(self, symbol: str, volume: float) -> None:
+        """Append volume and keep only the last 20 bars."""
+        if symbol not in self._volume_history:
+            self._volume_history[symbol] = []
+        self._volume_history[symbol].append(volume)
+        if len(self._volume_history[symbol]) > 20:
+            self._volume_history[symbol] = self._volume_history[symbol][-20:]
+
+    def _update_spy_trend(self, bar: BarData) -> None:
+        """NEW: Update SPY price history for trend analysis."""
+        if bar.symbol == 'SPY':
+            self._spy_history.append(bar.close)
+            if len(self._spy_history) > self.spy_trend_window:
+                self._spy_history = self._spy_history[-self.spy_trend_window:]
+
+    def _check_spy_trend(self) -> str:
+        """NEW: Determine SPY trend direction."""
+        if len(self._spy_history) < self.spy_trend_window:
+            return 'neutral'
         
-        total_volume = sum(b.volume for b in bars)
-        if total_volume == 0:
-            return bars[-1].close
+        start_price = self._spy_history[0]
+        end_price = self._spy_history[-1]
+        trend_pct = (end_price - start_price) / start_price
         
-        vwap = sum(b.close * b.volume for b in bars) / total_volume
-        return vwap
-    
-    def _calculate_atr(self, bars):
-        """Calculate Average True Range for volatility."""
-        if len(bars) < 2:
-            return 0.0
-        
-        trs = []
-        for i in range(1, len(bars)):
-            high_low = bars[i].high - bars[i].low
-            high_close = abs(bars[i].high - bars[i-1].close)
-            low_close = abs(bars[i].low - bars[i-1].close)
-            trs.append(max(high_low, high_close, low_close))
-        
-        if len(trs) >= self.atr_period:
-            return np.mean(trs[-self.atr_period:])
-        elif trs:
-            return np.mean(trs)
-        return 0.0
-    
-    def _detect_regime(self, bars):
-        """Detect market regime: trending or ranging."""
-        if len(bars) < self.trend_period:
-            return 'unknown'
-        
-        closes = pd.Series([b.close for b in bars[-self.trend_period:]])
-        
-        # Linear regression slope
-        x = np.arange(len(closes))
-        slope = np.polyfit(x, closes.values, 1)[0]
-        
-        # Normalize by price level
-        avg_price = closes.mean()
-        normalized_slope = slope / avg_price
-        
-        # R-squared for trend strength
-        y_pred = np.polyval(np.polyfit(x, closes.values, 1), x)
-        ss_res = np.sum((closes.values - y_pred) ** 2)
-        ss_tot = np.sum((closes.values - closes.mean()) ** 2)
-        r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
-        
-        # Strong trend if high R-squared and significant slope
-        if r_squared > self.regime_threshold:
-            if normalized_slope > 0.001:
-                return 'uptrend'
-            elif normalized_slope < -0.001:
-                return 'downtrend'
-        
-        return 'ranging'
-    
-    def _calculate_momentum_divergence(self, bars):
-        """Detect momentum divergence for reversal signals."""
-        if len(bars) < self.slow_momentum:
-            return 0.0
-        
-        closes = pd.Series([b.close for b in bars])
-        
-        # Calculate momentum
-        fast_mom = (closes.iloc[-1] - closes.iloc[-self.fast_momentum]) / closes.iloc[-self.fast_momentum]
-        slow_mom = (closes.iloc[-1] - closes.iloc[-self.slow_momentum]) / closes.iloc[-self.slow_momentum]
-        
-        # Divergence: fast momentum weakening relative to slow
-        divergence = fast_mom - slow_mom
-        return divergence
-    
-    def _is_institutional_volume(self, current_volume, avg_volume):
-        """Check if current volume indicates institutional activity."""
-        if avg_volume == 0:
-            return False
-        return current_volume > (avg_volume * self.volume_threshold)
-    
-    def _check_cooldown(self, symbol, bar):
-        """Check if symbol is in post-stop-loss cooldown."""
-        if symbol not in self.stop_loss_triggered:
-            return False
-        
-        bars_since_stop = self.stop_loss_triggered[symbol]
-        if bars_since_stop < self.stop_cooldown_bars:
-            self.stop_loss_triggered[symbol] += 1
-            return True
+        if trend_pct > 0.002:  # >0.2% trend
+            return 'bullish'
+        elif trend_pct < -0.002:  # <-0.2% trend
+            return 'bearish'
         else:
-            # Cooldown expired
-            del self.stop_loss_triggered[symbol]
-            return False
-    
-    def on_bar(self, bar: BarData):
+            return 'neutral'
+
+    def _check_momentum_filter(self, symbol: str) -> bool:
+        """Check if recent momentum is suitable for mean reversion."""
+        history = self.get_history(symbol, self.momentum_window)
+        if len(history) < self.momentum_window:
+            return True
+        
+        start_price = history[0].close
+        end_price = history[-1].close
+        momentum = (end_price - start_price) / start_price
+        
+        return abs(momentum) < self.max_momentum_threshold
+
+    def on_bar(self, bar: BarData) -> Optional[TradeSignal]:
         self.record_bar(bar)
         
-        # Check for liquidation
+        # Update SPY trend data
+        self._update_spy_trend(bar)
+
+        # Check liquidation first
         liq = self.check_liquidation(bar)
         if liq:
-            if bar.symbol in self.entry_prices:
-                del self.entry_prices[bar.symbol]
+            if liq.quantity > 0 and liq.symbol in self._bars_since_entry:
+                del self._bars_since_entry[liq.symbol]
             return liq if liq.quantity > 0 else None
-        
-        # Skip if in cooldown
-        if self._check_cooldown(bar.symbol, bar):
+
+        # Compute VWAP
+        vwap = self._get_vwap(bar.symbol, bar)
+        if vwap is None or vwap == 0:
+            self._update_volume_history(bar.symbol, bar.volume)
             return None
-        
-        # Skip if price/volume filters not met
-        if bar.close < self.min_price or bar.volume < self.min_volume:
-            return None
-        
-        # Get history
-        history = self.get_history(bar.symbol, lookback=max(self.volume_lookback, self.trend_period))
-        if len(history) < self.min_bars:
-            return None
-        
-        # Calculate indicators
-        vwap = self._calculate_vwap(history[-self.volume_lookback:])
-        atr = self._calculate_atr(history)
-        regime = self._detect_regime(history)
-        divergence = self._calculate_momentum_divergence(history)
-        
-        # Volume analysis
-        recent_volumes = [b.volume for b in history[-self.volume_lookback:-1]]
-        avg_volume = np.mean(recent_volumes) if recent_volumes else bar.volume
-        institutional_volume = self._is_institutional_volume(bar.volume, avg_volume)
-        
-        # Current position
+
+        self._update_volume_history(bar.symbol, bar.volume)
+
+        price = bar.close
+        deviation = (price - vwap) / vwap
+        abs_deviation = abs(deviation)
+        avg_volume = self._get_avg_volume(bar.symbol)
         current_position = self._positions.get(bar.symbol, 0)
-        current_price = bar.close
-        
-        # Store regime
-        self.regime_state[bar.symbol] = regime
-        
-        # EXIT LOGIC
+        entry_price = self._entry_prices.get(bar.symbol, 0)
+        spy_trend = self._check_spy_trend()
+
+        # Increment bars counter for positions
         if current_position > 0:
-            entry_price = self.entry_prices.get(bar.symbol, current_price)
-            pnl_pct = (current_price - entry_price) / entry_price * 100.0
-            
-            should_exit = False
-            exit_reason = ""
-            
-            # 1. Stop loss
-            if pnl_pct <= -self.stop_loss_pct:
-                should_exit = True
-                exit_reason = "stop_loss"
-                self.stop_loss_triggered[bar.symbol] = 0  # Start cooldown
-            
-            # 2. Take profit
-            elif pnl_pct >= self.take_profit_pct:
-                should_exit = True
-                exit_reason = "take_profit"
-            
-            # 3. Regime change exit
-            elif regime == 'downtrend' and entry_price < current_price:
-                should_exit = True
-                exit_reason = "regime_change"
-            
-            # 4. Momentum divergence exit
-            elif divergence < -self.divergence_threshold and pnl_pct > 0:
-                should_exit = True
-                exit_reason = "divergence"
-            
-            # 5. VWAP reversion exit in ranging market
-            elif regime == 'ranging' and vwap and current_price > vwap * (1 + self.vwap_deviation):
-                should_exit = True
-                exit_reason = "vwap_reversion"
-            
-            if should_exit:
-                if bar.symbol in self.entry_prices:
-                    del self.entry_prices[bar.symbol]
-                logging.info(f"Exit {bar.symbol} - {exit_reason}: {pnl_pct:.2f}% PnL")
-                return TradeSignal(symbol=bar.symbol, side="sell", quantity=current_position)
-        
-        # ENTRY LOGIC
-        elif current_position == 0 and len(self._positions) < self.max_positions:
-            should_enter = False
-            entry_reason = ""
-            
-            # Dynamic position sizing based on volatility
-            if atr > 0:
-                volatility_scalar = min(1.5, max(0.5, 1.0 / (atr / current_price)))
-                position_size = self.base_allocation * volatility_scalar
-            else:
-                position_size = self.base_allocation
-            
-            # 1. Trend following with volume confirmation
-            if regime == 'uptrend' and institutional_volume:
-                should_enter = True
-                entry_reason = "trend_volume"
-            
-            # 2. Mean reversion in ranging market
-            elif regime == 'ranging' and vwap:
-                if current_price < vwap * (1 - self.vwap_deviation) and divergence > 0:
-                    should_enter = True
-                    entry_reason = "vwap_reversion_long"
-            
-            # 3. Momentum divergence reversal
-            elif abs(divergence) > self.divergence_threshold:
-                if divergence > 0 and institutional_volume:
-                    should_enter = True
-                    entry_reason = "bullish_divergence"
-            
-            # 4. Breakout with volume
-            elif len(history) > 20:
-                twenty_bar_high = max(b.high for b in history[-20:])
-                if current_price > twenty_bar_high * 0.995 and institutional_volume:
-                    should_enter = True
-                    entry_reason = "breakout"
-            
-            if should_enter:
-                qty = self.compute_quantity(current_price, position_size)
+            self._bars_since_entry[bar.symbol] = (
+                self._bars_since_entry.get(bar.symbol, 0) + 1
+            )
+
+        # Cache indicators
+        self._indicators[bar.symbol] = {
+            "close": price,
+            "vwap": vwap,
+            "deviation_from_vwap": deviation,
+            "spy_trend": spy_trend
+        }
+
+        # --- EXIT LOGIC ---
+        if current_position > 0 and entry_price > 0:
+            # Fast profit-taking (tightened)
+            pnl_pct = ((price - entry_price) / entry_price) * 100
+            if pnl_pct >= self.fast_profit_pct:
+                del self._bars_since_entry[bar.symbol]
+                return TradeSignal(
+                    symbol=bar.symbol,
+                    side="sell",
+                    quantity=current_position,
+                    reason="fast_profit",
+                )
+
+            # Regime-aware early exit in bearish conditions
+            if spy_trend == 'bearish' and pnl_pct < -0.5:
+                del self._bars_since_entry[bar.symbol]
+                return TradeSignal(
+                    symbol=bar.symbol,
+                    side="sell",
+                    quantity=current_position,
+                    reason="regime_defensive",
+                )
+
+            # Reversion timeout (faster)
+            bars_held = self._bars_since_entry.get(bar.symbol, 0)
+            if bars_held >= self.reversion_timeout:
+                del self._bars_since_entry[bar.symbol]
+                return TradeSignal(
+                    symbol=bar.symbol,
+                    side="sell",
+                    quantity=current_position,
+                    reason="reversion_timeout",
+                )
+
+            # VWAP reversion sell
+            volume_ok = (
+                avg_volume > 0
+                and bar.volume > avg_volume * self.min_volume_ratio
+            )
+            if (
+                deviation > self.vwap_deviation_threshold
+                and abs_deviation < self.max_deviation
+                and volume_ok
+            ):
+                del self._bars_since_entry[bar.symbol]
+                return TradeSignal(
+                    symbol=bar.symbol,
+                    side="sell",
+                    quantity=current_position,
+                    reason="vwap_reversion",
+                )
+
+        # --- ENTRY LOGIC ---
+        if current_position == 0 and len(self._positions) < self.max_positions:
+            if avg_volume <= 0:
+                return None
+
+            # Apply momentum filter
+            if not self._check_momentum_filter(bar.symbol):
+                return None
+
+            # NEW: SPY trend filter - be more selective in bearish conditions
+            if spy_trend == 'bearish' and abs_deviation < 0.003:
+                return None  # Skip small deviations in bear market
+
+            volume_confirmed = bar.volume > avg_volume * self.volume_confirmation
+            below_vwap = deviation < -self.vwap_deviation_threshold
+            within_max = abs_deviation < self.max_deviation
+
+            if below_vwap and within_max and volume_confirmed:
+                # Regime-adjusted position sizing
+                base_allocation = self.allocation_pct
+                if spy_trend == 'bearish':
+                    base_allocation *= 0.7  # Reduce size in bear market
+                elif spy_trend == 'bullish':
+                    base_allocation *= 1.2  # Slightly increase in bull market
+                
+                qty = self.compute_quantity(
+                    price, base_allocation, symbol=bar.symbol
+                )
                 if qty > 0:
-                    self.entry_prices[bar.symbol] = current_price
-                    logging.info(f"Enter {bar.symbol} - {entry_reason}: regime={regime}, vol_spike={institutional_volume}")
-                    return TradeSignal(symbol=bar.symbol, side="buy", quantity=qty)
-        
+                    self._bars_since_entry[bar.symbol] = 0
+                    return TradeSignal(
+                        symbol=bar.symbol, side="buy", quantity=qty
+                    )
+
         return None
-    
-    def get_params(self):
+
+    def get_params(self) -> dict:
         return {
-            "volume_lookback": self.volume_lookback,
-            "volume_threshold": self.volume_threshold,
-            "vwap_deviation": self.vwap_deviation,
-            "fast_momentum": self.fast_momentum,
-            "slow_momentum": self.slow_momentum,
-            "divergence_threshold": self.divergence_threshold,
-            "atr_period": self.atr_period,
-            "trend_period": self.trend_period,
-            "regime_threshold": self.regime_threshold,
-            "base_allocation": self.base_allocation,
+            "vwap_deviation_threshold": self.vwap_deviation_threshold,
+            "volume_confirmation": self.volume_confirmation,
+            "max_deviation": self.max_deviation,
+            "reversion_timeout": self.reversion_timeout,
+            "min_volume_ratio": self.min_volume_ratio,
+            "momentum_window": self.momentum_window,
+            "max_momentum_threshold": self.max_momentum_threshold,
+            "spy_trend_window": self.spy_trend_window,
+            "fast_profit_pct": self.fast_profit_pct,
+            "allocation_pct": self.allocation_pct,
             "max_positions": self.max_positions,
             "stop_loss_pct": self.stop_loss_pct,
             "take_profit_pct": self.take_profit_pct,
-            "stop_cooldown_bars": self.stop_cooldown_bars,
-            "min_price": self.min_price,
-            "min_volume": self.min_volume,
-            "min_bars": self.min_bars
         }
-    
-    def set_params(self, params):
-        # Volume parameters
-        self.volume_lookback = max(10, min(50, int(params.get("volume_lookback", self.volume_lookback))))
-        self.volume_threshold = max(1.1, min(3.0, float(params.get("volume_threshold", self.volume_threshold))))
-        self.vwap_deviation = max(0.001, min(0.01, float(params.get("vwap_deviation", self.vwap_deviation))))
+
+    def set_params(self, params: dict) -> None:
+        self.vwap_deviation_threshold = max(
+            0.0005, min(0.005, float(params.get("vwap_deviation_threshold", self.vwap_deviation_threshold)))
+        )
+        self.volume_confirmation = max(
+            1.0, min(2.0, float(params.get("volume_confirmation", self.volume_confirmation)))
+        )
+        self.max_deviation = max(
+            0.003, min(0.02, float(params.get("max_deviation", self.max_deviation)))
+        )
+        self.reversion_timeout = max(
+            5, min(15, int(params.get("reversion_timeout", self.reversion_timeout)))
+        )
+        self.spy_trend_window = max(
+            3, min(10, int(params.get("spy_trend_window", self.spy_trend_window)))
+        )
+        self.allocation_pct = max(
+            0.03, min(0.15, float(params.get("allocation_pct", self.allocation_pct)))
+        )
+        self.max_positions = max(
+            3, min(10, int(params.get("max_positions", self.max_positions)))
+        )
+
+    def adapt(self, recent_signals: list, recent_fills: list, realized_pnl: float) -> None:
+        """Adapt based on regime and performance."""
+        wins = sum(1 for f in recent_fills if isinstance(f, dict) and f.get("pnl", 0) > 0)
+        total = sum(1 for f in recent_fills if isinstance(f, dict) and f.get("side") == "sell")
         
-        # Momentum parameters
-        self.fast_momentum = max(3, min(10, int(params.get("fast_momentum", self.fast_momentum))))
-        self.slow_momentum = max(10, min(30, int(params.get("slow_momentum", self.slow_momentum))))
-        self.divergence_threshold = max(0.001, min(0.01, float(params.get("divergence_threshold", self.divergence_threshold))))
+        self._adapt_wins += wins
+        self._adapt_total += total
         
-        # Regime parameters
-        self.atr_period = max(5, min(20, int(params.get("atr_period", self.atr_period))))
-        self.trend_period = max(10, min(50, int(params.get("trend_period", self.trend_period))))
-        self.regime_threshold = max(0.3, min(0.9, float(params.get("regime_threshold", self.regime_threshold))))
-        
-        # Risk parameters
-        self.base_allocation = max(0.05, min(0.3, float(params.get("base_allocation", self.base_allocation))))
-        self.max_positions = max(1, min(5, int(params.get("max_positions", self.max_positions))))
-        self.stop_loss_pct = max(0.5, min(3.0, float(params.get("stop_loss_pct", self.stop_loss_pct))))
-        self.take_profit_pct = max(1.0, min(5.0, float(params.get("take_profit_pct", self.take_profit_pct))))
-        self.stop_cooldown_bars = max(5, min(30, int(params.get("stop_cooldown_bars", self.stop_cooldown_bars))))
-        
-        # Filter parameters
-        self.min_price = max(1.0, min(20.0, float(params.get("min_price", self.min_price))))
-        self.min_volume = max(100000, min(10000000, int(params.get("min_volume", self.min_volume))))
-        self.min_bars = max(20, min(100, int(params.get("min_bars", self.min_bars))))
-    
-    def adapt(self, recent_signals, recent_fills, realized_pnl):
-        """Adapt parameters based on recent performance."""
-        if not recent_fills:
-            # No trades - loosen filters
-            self.volume_threshold = max(1.1, self.volume_threshold - 0.1)
-            self.min_volume = max(100000, self.min_volume - 100000)
-            logging.info("Loosening filters due to lack of trades")
-            return
-        
-        # Analyze regime performance
-        regime_performance = {}
-        for fill in recent_fills:
-            symbol = fill.get('symbol')
-            pnl = fill.get('realized_pnl', 0)
-            regime = self.regime_state.get(symbol, 'unknown')
+        if self._adapt_total >= 5:
+            win_rate = self._adapt_wins / self._adapt_total
             
-            if regime not in regime_performance:
-                regime_performance[regime] = []
-            regime_performance[regime].append(pnl)
-        
-        # Adjust based on regime success
-        for regime, pnls in regime_performance.items():
-            avg_pnl = np.mean(pnls)
-            if regime == 'trending' and avg_pnl < 0:
-                # Trend following not working - tighten criteria
-                self.regime_threshold = min(0.9, self.regime_threshold + 0.05)
-            elif regime == 'ranging' and avg_pnl > 0:
-                # Mean reversion working - widen VWAP bands
-                self.vwap_deviation = min(0.01, self.vwap_deviation + 0.0005)
-        
-        # Overall performance adjustments
-        if realized_pnl < -20:
-            # Tighten risk
-            self.stop_loss_pct = max(0.5, self.stop_loss_pct - 0.25)
-            self.base_allocation = max(0.05, self.base_allocation - 0.02)
-            logging.info(f"Tightened risk: stop={self.stop_loss_pct}%, allocation={self.base_allocation:.1%}")
-        elif realized_pnl > 50:
-            # Loosen profit targets to let winners run
-            self.take_profit_pct = min(5.0, self.take_profit_pct + 0.25)
-            logging.info(f"Increased profit target to {self.take_profit_pct}%")
+            # Adjust thresholds based on win rate and regime
+            if win_rate < 0.4:
+                self.vwap_deviation_threshold = min(0.003, self.vwap_deviation_threshold + 0.0003)
+                self.max_momentum_threshold = max(0.01, self.max_momentum_threshold - 0.003)
+            elif win_rate > 0.7:
+                self.vwap_deviation_threshold = max(0.001, self.vwap_deviation_threshold - 0.0002)
+
+    def reset(self) -> None:
+        """Clear all internal state for a new session."""
+        super().reset()
+        self._cumulative_vol.clear()
+        self._cumulative_vp.clear()
+        self._bars_since_entry.clear()
+        self._volume_history.clear()
+        self._spy_history.clear()
+        self._adapt_wins = 0
+        self._adapt_total = 0

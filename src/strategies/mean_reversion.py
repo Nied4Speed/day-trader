@@ -46,7 +46,7 @@ class MeanReversionStrategy(Strategy):
         }
 
         if deviation < self.buy_deviation:
-            qty = self.compute_quantity(bar.close, self.allocation_pct)
+            qty = self.compute_quantity(bar.close, self.allocation_pct, symbol=bar.symbol)
             if qty > 0:
                 return TradeSignal(symbol=bar.symbol, side="buy", quantity=qty)
         if deviation > self.sell_deviation:

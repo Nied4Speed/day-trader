@@ -54,7 +54,6 @@ class PerformanceTracker:
         self._metrics: dict[int, ModelMetrics] = {}
         self._session_number: int = 1
         self._session_date: Optional[str] = None
-        self._session_start_utc: Optional[datetime] = None
 
     def set_session_number(self, session_number: int) -> None:
         """Set which session we're tracking (1 or 2)."""
@@ -67,7 +66,6 @@ class PerformanceTracker:
     def initialize_models(self, models: list[TradingModel]) -> None:
         """Set up tracking for a list of models at session start."""
         self._metrics.clear()
-        self._session_start_utc = datetime.utcnow()
         for model in models:
             self._metrics[model.id] = ModelMetrics(
                 model_id=model.id,
@@ -107,14 +105,12 @@ class PerformanceTracker:
                     price = last_prices.get(p.symbol, p.current_price)
                     unrealized += (price - p.avg_entry_price) * p.quantity
 
-            # Trade stats from filled orders (scoped to current session start time)
+            # Trade stats from filled orders (scoped to today's date, cumulative across sessions)
             order_query = db.query(Order).filter(
                 Order.model_id == model_id,
                 Order.status == OrderStatus.FILLED,
             )
-            if self._session_start_utc:
-                order_query = order_query.filter(Order.filled_at >= self._session_start_utc)
-            elif self._session_date:
+            if self._session_date:
                 order_query = order_query.filter(Order.session_date == self._session_date)
             filled_orders = order_query.all()
             metrics.total_trades = len(filled_orders)

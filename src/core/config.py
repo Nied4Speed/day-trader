@@ -63,7 +63,7 @@ class ArenaConfig:
     screener_enabled: bool = True  # run pre-market screener to discover hot symbols
     screener_max_additions: int = 20  # max dynamic symbols to add on top of core list
     screener_min_price: float = 5.0  # skip stocks below this price
-    screener_interval_minutes: int = 15  # re-run screener every N minutes during session (0=once at start only)
+    screener_interval_minutes: int = 5  # re-run screener every N minutes during session (0=once at start only)
     symbols: list[str] = field(default_factory=lambda: [
         "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA",
         "META", "TSLA", "JPM", "V", "SPY",

@@ -61,6 +61,9 @@ class ExecutionHandler:
         self.retry_stats: dict[str, int] = {"buy_retries": 0, "sell_retries": 0, "buy_retry_success": 0, "sell_retry_success": 0}
         # Fractionable cache: symbol -> bool (lazily populated)
         self._fractionable_cache: dict[str, bool] = {}
+        # Per-model initial capital (CFA-allocated). Populated by arena at startup.
+        # Falls back to config default if a model isn't registered here.
+        self._model_initial_capital: dict[int, float] = {}
 
     @property
     def client(self) -> TradingClient:
@@ -235,7 +238,10 @@ class ExecutionHandler:
             daily_pnl = self._daily_pnl.get(model_id, 0.0)
             # Use initial_capital (budget ceiling) so the check works even when
             # current_capital is negative (all capital deployed in positions).
-            max_loss = self.config.arena.initial_capital * self.config.arena.max_daily_loss_pct
+            model_capital = self._model_initial_capital.get(
+                model_id, self.config.arena.initial_capital
+            )
+            max_loss = model_capital * self.config.arena.max_daily_loss_pct
             if daily_pnl < -max_loss:
                 self._daily_loss_breached.add(model_id)
                 raise RiskLimitExceeded(
@@ -378,6 +384,7 @@ class ExecutionHandler:
         signal: TradeSignal,
         current_capital: float,
         session_date: str,
+        strategy_qty: float = 0.0,
     ) -> Optional[Order]:
         """Submit an order to Alpaca after risk checks."""
         # Minimum quantity guard — Alpaca rejects qty <= 0 or ~1e-9.
@@ -443,21 +450,27 @@ class ExecutionHandler:
                         .filter(Position.model_id == model_id, Position.symbol == signal.symbol)
                         .first()
                     )
-                    if not pos or pos.quantity <= 0:
+                    db_qty = pos.quantity if pos and pos.quantity > 0 else 0.0
+                    # Use the larger of DB or in-memory qty to prevent silent
+                    # sell drops when DB is stale/zero but strategy holds shares.
+                    effective_qty = max(db_qty, strategy_qty or 0.0)
+                    if effective_qty <= 0:
                         logger.debug(
-                            f"Skipping sell for model {model_id} {signal.symbol}: no position held"
+                            f"Skipping sell for model {model_id} {signal.symbol}: "
+                            f"no position held (db={db_qty:.4f}, mem={strategy_qty:.4f})"
                         )
                         return None
-                    # Clamp sell quantity to actual position to prevent selling
+                    # Clamp sell quantity to effective position to prevent selling
                     # shares that belong to other models in the shared Alpaca account.
-                    if signal.quantity > pos.quantity:
+                    if signal.quantity > effective_qty:
                         logger.info(
                             f"Clamping sell qty for model {model_id} {signal.symbol}: "
-                            f"{signal.quantity:.4f} -> {pos.quantity:.4f}"
+                            f"{signal.quantity:.4f} -> {effective_qty:.4f} "
+                            f"(db={db_qty:.4f}, mem={strategy_qty:.4f})"
                         )
                         signal = TradeSignal(
                             symbol=signal.symbol, side="sell",
-                            quantity=pos.quantity,
+                            quantity=effective_qty,
                             order_type=signal.order_type,
                             limit_price=signal.limit_price,
                         )
@@ -466,7 +479,8 @@ class ExecutionHandler:
                     if signal.quantity < 0.001:
                         logger.debug(
                             f"Skipping sell for model {model_id} {signal.symbol}: "
-                            f"clamped qty {signal.quantity:.6f} too small"
+                            f"clamped qty {signal.quantity:.6f} too small "
+                            f"(db={db_qty:.4f}, mem={strategy_qty:.4f})"
                         )
                         return None
 
@@ -573,6 +587,7 @@ class ExecutionHandler:
         signal: TradeSignal,
         current_capital: float,
         session_date: str,
+        strategy_qty: float = 0.0,
     ) -> Optional[Order]:
         """Async version of submit_order — doesn't block the event loop.
 
@@ -580,7 +595,8 @@ class ExecutionHandler:
         loop remains free for quote processing and other models.
         """
         return await asyncio.to_thread(
-            self.submit_order, model_id, signal, current_capital, session_date
+            self.submit_order, model_id, signal, current_capital, session_date,
+            strategy_qty,
         )
 
     def _is_fractionable(self, symbol: str) -> bool:

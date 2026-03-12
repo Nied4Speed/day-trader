@@ -126,7 +126,7 @@ class MLPredictorStrategy(Strategy):
         }
 
         if predicted_return > self.buy_threshold:
-            qty = self.compute_quantity(bar.close, self.allocation_pct)
+            qty = self.compute_quantity(bar.close, self.allocation_pct, symbol=bar.symbol)
             if qty > 0:
                 return TradeSignal(symbol=bar.symbol, side="buy", quantity=qty)
 

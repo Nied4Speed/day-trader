@@ -31,6 +31,8 @@ class BreakoutStrategy(Strategy):
         if liq:
             return liq if liq.quantity > 0 else None
         history = self.get_history(bar.symbol)
+        if not history:
+            return None
         bar_count = len(history)
 
         if bar_count <= self.range_bars:
@@ -62,7 +64,7 @@ class BreakoutStrategy(Strategy):
         }
 
         if bar.close > threshold_high:
-            qty = self.compute_quantity(bar.close, self.allocation_pct)
+            qty = self.compute_quantity(bar.close, self.allocation_pct, symbol=bar.symbol)
             if qty > 0:
                 return TradeSignal(symbol=bar.symbol, side="buy", quantity=qty)
 

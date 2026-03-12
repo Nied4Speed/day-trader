@@ -34,6 +34,34 @@ from src.core.database import (
 
 logger = logging.getLogger(__name__)
 
+# Changelog of system changes — most recent first. CFA sees the last 10.
+# Prepend new entries when making changes that affect trading behavior.
+SYSTEM_CHANGELOG: list[tuple[str, str]] = [
+    ("2026-03-12", "DailyContext on every bar — strategies now receive bar.daily_context (daily open/high/low/VWAP, prev close, change_from_open_pct, daily_range_position) and bar.spy_daily_context (SPY as market trend proxy). Screener additions seeded from Alpaca snapshots. Zero extra API calls."),
+    ("2026-03-11", "Added profit stagnation exit — sells positions +0.5% to <TP that go flat for 15+ bars"),
+    ("2026-03-11", "Added position-aware sizing — compute_quantity tapers per-symbol exposure to prevent oversized positions"),
+    ("2026-03-11", "New strategies: volume_profile_reversion (POC support/resistance), volatility_compression (BB squeeze breakout)"),
+    ("2026-03-11", "Independent model trading — removed position manager netting, each model submits own orders"),
+    ("2026-03-11", "Trailing TP — take_profit_pct now activates trailing stop tiers instead of hard sell"),
+    ("2026-03-11", "Fixed arena stop endpoint crash — safe attribute access on detached SQLAlchemy objects"),
+    ("2026-03-10", "Added ratcheting trailing stops (trailing_stop_tiers) — trail tightens as gain grows"),
+    ("2026-03-10", "Added patience stops (patience_stop_tiers) — exits slow-bleed losers after N bars underwater"),
+    ("2026-03-10", "CFA-seeded initial trailing_stop_tiers and patience_stop_tiers for all 13 models"),
+    ("2026-03-10", "Fixed circuit breaker blocking sells — all guards now buy-only, sells always reach Alpaca"),
+    ("2026-03-10", "Fixed wash trade cooldown blocking sells — cooldown now buy-only"),
+    ("2026-03-10", "Fixed position symbols dropped from feed — session start merges held symbols into universe"),
+    ("2026-03-10", "Added single-stock leveraged ETFs (NVD, TSLL, MSTU, CONL, etc.) to screener blocklist"),
+    ("2026-03-10", "Added mission control health checks — data flow, subscription integrity, sell path, model state"),
+    ("2026-03-09", "Wired up stop-losses (were dead code previously), fixed unit mismatch (0.02 vs 2.0)"),
+    ("2026-03-09", "Fixed position duplication from shared Alpaca account reconciliation"),
+    ("2026-03-09", "Fixed P&L tracking — equity = capital + position_cost + unrealized"),
+    ("2026-03-09", "Added sell qty clamping to prevent overselling from shared Alpaca account"),
+    ("2026-03-08", "CFA enriched with news sentiment, sector analysis, options data, corporate actions"),
+    ("2026-03-06", "Fixed post-session freeze (freeze bug #3) — stream close timeout + timer await"),
+    ("2026-03-06", "Capital tracking fixed — daily ledger saved BEFORE self-improvement"),
+    ("2026-03-05", "Fixed event loop freeze #1 — bar batching, async trade updates"),
+]
+
 
 def _gather_bar_summaries(db, session_date: str) -> dict[str, Any]:
     """Build market data summaries from stored bars for the given date.
@@ -269,6 +297,99 @@ def _gather_news_sentiment(
     }
 
 
+def _gather_cfa_memory(db_path: str, session_date: str, max_reviews: int = 5) -> list[dict]:
+    """Query prior CFA reviews and cross-reference with next-day outcomes.
+
+    Returns a list of dicts, most recent first, each containing:
+    - date, grade, key action items, param rec summary
+    - next_day_outcome: whether the portfolio improved/declined the day after
+    - strategy_evolution fields if present
+    """
+    db = get_session(db_path)
+    try:
+        prior_reviews = (
+            db.query(CfaReview)
+            .filter(CfaReview.session_date < session_date, CfaReview.review_json.isnot(None))
+            .order_by(CfaReview.session_date.desc())
+            .limit(max_reviews)
+            .all()
+        )
+        if not prior_reviews:
+            return []
+
+        memory: list[dict] = []
+        for review in prior_reviews:
+            rj = review.review_json or {}
+
+            # Extract high-priority action items (top 5)
+            action_items = rj.get("action_items", [])
+            high_actions = [
+                a.get("action", "") for a in action_items
+                if isinstance(a, dict) and a.get("priority") == "high"
+            ][:5]
+
+            # Summarize param recs: model_name -> {param: value}
+            param_recs = rj.get("parameter_recommendations", [])
+            param_summary = {}
+            for rec in (param_recs if isinstance(param_recs, list) else []):
+                if isinstance(rec, dict) and rec.get("model_name"):
+                    params = rec.get("recommendations", {})
+                    if isinstance(params, dict):
+                        param_summary[rec["model_name"]] = {
+                            k: v.get("value") if isinstance(v, dict) else v
+                            for k, v in params.items()
+                        }
+
+            # Cross-reference: what happened the day AFTER this review?
+            next_day_outcome = None
+            next_day_ledgers = (
+                db.query(DailyLedger)
+                .filter(DailyLedger.session_date > review.session_date)
+                .order_by(DailyLedger.session_date.asc())
+                .limit(25)  # up to 25 models for one day
+                .all()
+            )
+            if next_day_ledgers:
+                next_date = next_day_ledgers[0].session_date
+                same_day = [l for l in next_day_ledgers if l.session_date == next_date]
+                total_return = sum(l.daily_return_pct for l in same_day)
+                avg_return = total_return / len(same_day) if same_day else 0
+
+                # Per-model results so CFA can see how its specific recs played out
+                model_results = {}
+                for ledger in same_day:
+                    m = db.query(TradingModel).filter(TradingModel.id == ledger.model_id).first()
+                    if m:
+                        model_results[m.name] = {
+                            "return_pct": round(ledger.daily_return_pct, 4),
+                            "trades": ledger.total_trades,
+                        }
+
+                next_day_outcome = {
+                    "date": next_date,
+                    "avg_return_pct": round(avg_return, 4),
+                    "model_count": len(same_day),
+                    "verdict": "improved" if avg_return > 0 else "declined",
+                    "per_model": model_results,
+                }
+
+            entry = {
+                "date": review.session_date,
+                "grade": rj.get("portfolio_grade", "?"),
+                "executive_summary": (rj.get("executive_summary", "") or "")[:200],
+                "high_priority_actions": high_actions,
+                "param_recs_summary": param_summary,
+                "strategy_evolution": rj.get("strategy_evolution"),
+                "roster_changes": rj.get("roster_changes"),
+                "next_day_outcome": next_day_outcome,
+            }
+            memory.append(entry)
+
+        return memory
+    finally:
+        db.close()
+
+
 def _gather_review_data(
     db_path: str,
     session_date: str,
@@ -344,6 +465,21 @@ def _gather_review_data(
             # are closed, so equity = start + realized_pnl.
             end_cap = start_cap + model_realized
 
+            # Aggregate exit reasons for this model's sells today
+            reason_rows = (
+                db.query(Order.signal_reason, func.count(Order.id))
+                .filter(
+                    Order.model_id == m.id,
+                    Order.session_date == session_date,
+                    Order.status == OrderStatus.FILLED,
+                    Order.side == OrderSide.SELL,
+                    Order.signal_reason.isnot(None),
+                )
+                .group_by(Order.signal_reason)
+                .all()
+            )
+            exit_reasons = {reason: count for reason, count in reason_rows}
+
             # Parse model parameters for risk control visibility
             params = {}
             if m.parameters:
@@ -371,8 +507,9 @@ def _gather_review_data(
                 "take_profit_pct": params.get("take_profit_pct"),
                 "all_parameters": {
                     k: v for k, v in params.items()
-                    if not k.startswith("_") and isinstance(v, (int, float, bool))
+                    if not k.startswith("_") and isinstance(v, (int, float, bool, list))
                 },
+                "exit_reasons": exit_reasons,
             })
 
         model_rows.sort(key=lambda r: r["return_pct"], reverse=True)
@@ -557,6 +694,15 @@ def _gather_review_data(
             o.realized_pnl for o in sells_with_pnl
         )
 
+        # Alpaca ground-truth P&L from session records
+        alpaca_pnl_total = None
+        for s in sessions:
+            if s.alpaca_pnl is not None:
+                alpaca_pnl_total = (alpaca_pnl_total or 0.0) + s.alpaca_pnl
+        unattributed_pnl = None
+        if alpaca_pnl_total is not None:
+            unattributed_pnl = round(alpaca_pnl_total - total_realized, 2)
+
         # Core vs dynamic symbols (core list from config)
         core_symbols = {
             "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA",
@@ -626,6 +772,8 @@ def _gather_review_data(
                     sorted(returns)[len(returns) // 2] if returns else 0.0, 4
                 ),
                 "total_realized_pnl": round(total_realized, 2),
+                "alpaca_pnl": round(alpaca_pnl_total, 2) if alpaca_pnl_total is not None else None,
+                "unattributed_pnl": unattributed_pnl,
             },
             "models": model_rows,
             "reflections": {
@@ -697,6 +845,7 @@ def _gather_review_data(
             "sector_analysis": sector_analysis,
             "options_data": options_data,
             "upcoming_events": upcoming_events,
+            "cfa_memory": _gather_cfa_memory(db_path, session_date),
         }
     finally:
         db.close()
@@ -706,131 +855,246 @@ def _build_cfa_model_section(data: dict[str, Any]) -> str:
     """Build the CFA model context section for the prompt."""
     cfa = data.get("cfa_model")
     if not cfa:
-        return "### Your previous strategy\nThis is the FIRST time you are generating a strategy. There is no previous code."
+        return "### Your previous strategy\nThis is the FIRST time you are generating a strategy. There is no previous code.\nState your hypothesis for the initial design."
 
     lines = ["### Your previous strategy"]
     perf = cfa.get("performance")
     if perf:
         lines.append(f"Return: {perf.get('return_pct', 0)}%, Trades: {perf.get('trades', 0)}, "
                       f"Win rate: {perf.get('win_rate', 0)}%, Realized PnL: ${perf.get('realized_pnl', 0)}")
+
+    # Show prior evolution hypothesis if available (from cfa_memory)
+    cfa_mem = data.get("cfa_memory", [])
+    for entry in cfa_mem:
+        evolution = entry.get("strategy_evolution")
+        if evolution and isinstance(evolution, dict):
+            hypo = evolution.get("hypothesis", "")
+            predicted = evolution.get("predicted_performance", {})
+            if hypo:
+                lines.append(f"\nYour prior hypothesis ({entry['date']}): {hypo}")
+            if predicted:
+                lines.append(f"Your prediction: win_rate={predicted.get('expected_win_rate_pct', '?')}%, "
+                             f"avg_pnl=${predicted.get('expected_avg_pnl_per_trade', '?')}")
+            if perf:
+                lines.append(f"Actual result: win_rate={perf.get('win_rate', '?')}%, "
+                             f"realized_pnl=${perf.get('realized_pnl', '?')}")
+                lines.append("Evaluate: did your hypothesis hold? What needs to change?")
+            break  # Only show most recent evolution
+
     source = cfa.get("current_source", "")
     if source:
         lines.append("\n```python")
         lines.append(source)
         lines.append("```")
-        lines.append("\nAnalyze what worked and what didn't. You may refine or completely rewrite.")
+        lines.append("\nMake at most 3 targeted changes. State what you're changing and why.")
     else:
         lines.append("Previous source code not found. Generate fresh.")
 
     return "\n".join(lines)
 
 
+def _build_changelog_section(since_date: str | None = None) -> str:
+    """Build a changelog section, filtered to entries since last review date."""
+    if since_date:
+        entries = [(d, desc) for d, desc in SYSTEM_CHANGELOG if d > since_date]
+    else:
+        entries = SYSTEM_CHANGELOG[:10]
+    if not entries:
+        return ""
+    lines = ["## Recent System Changes (since last review)"]
+    lines.append("")
+    lines.append("Evaluate whether each change helped or hurt. Reference in `changelog_assessment`.")
+    lines.append("")
+    for date, description in entries:
+        lines.append(f"- **{date}**: {description}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _build_cfa_memory_section(data: dict[str, Any]) -> str:
+    """Build the Prior Reviews & Accountability prompt section from cfa_memory."""
+    memory = data.get("cfa_memory", [])
+    if not memory:
+        return ""
+
+    lines = [
+        "## Prior Reviews & Accountability",
+        "",
+        "You have access to your last reviews WITH next-day outcomes showing exactly how each",
+        "model you recommended changes for actually performed. For each prior review:",
+        "1. Check the per-model results — did models you tuned improve or get worse?",
+        "2. Did roster changes you recommended (replacements, probation) pan out?",
+        "3. Were your performance predictions (win rate, avg P&L) accurate?",
+        "4. Course-correct failures. Do NOT repeat recommendations that clearly didn't work",
+        "   without explaining what's different this time.",
+        "5. Double down on recommendations that worked — similar logic, tighter params.",
+        "",
+    ]
+    for entry in memory:
+        date = entry.get("date", "?")
+        grade = entry.get("grade", "?")
+        lines.append(f"### Review: {date} (Grade: {grade})")
+        summary = entry.get("executive_summary", "")
+        if summary:
+            lines.append(f"Summary: {summary}")
+
+        actions = entry.get("high_priority_actions", [])
+        if actions:
+            lines.append("High-priority actions you recommended:")
+            for a in actions:
+                lines.append(f"  - {a}")
+
+        param_summary = entry.get("param_recs_summary", {})
+        if param_summary:
+            lines.append("Parameter changes you recommended:")
+            for model_name, params in param_summary.items():
+                if isinstance(params, dict):
+                    param_strs = [f"{k}={v}" for k, v in params.items()]
+                    lines.append(f"  - {model_name}: {', '.join(param_strs)}")
+                else:
+                    lines.append(f"  - {model_name}: {params}")
+
+        roster = entry.get("roster_changes")
+        if roster and isinstance(roster, dict):
+            replacements = roster.get("replace", [])
+            if replacements:
+                lines.append("Roster changes you recommended:")
+                for r in replacements:
+                    if isinstance(r, dict):
+                        remove = r.get("remove", "?")
+                        repl = r.get("replacement_type") or r.get("replacement_strategy_type", "?")
+                        lines.append(f"  - Remove {remove} -> Add {repl}")
+            probation = roster.get("probation", [])
+            if probation:
+                lines.append("Models you put on probation:")
+                for p in probation:
+                    if isinstance(p, dict):
+                        lines.append(f"  - {p.get('model', '?')}: {p.get('reason', '')}")
+
+        evolution = entry.get("strategy_evolution")
+        if evolution and isinstance(evolution, dict):
+            hypo = evolution.get("hypothesis", "")
+            predicted = evolution.get("predicted_performance", {})
+            if hypo:
+                lines.append(f"Your hypothesis: {hypo}")
+            if predicted:
+                lines.append(f"Your predictions: {json.dumps(predicted)}")
+
+        outcome = entry.get("next_day_outcome")
+        if outcome:
+            lines.append(
+                f"**Next-day result ({outcome['date']}): {outcome['verdict']}** "
+                f"(avg return {outcome['avg_return_pct']}% across {outcome['model_count']} models)"
+            )
+            # Show per-model outcomes for models the CFA specifically recommended changes for
+            per_model = outcome.get("per_model", {})
+            if per_model and param_summary:
+                lines.append("How your recommended models performed next day:")
+                for model_name in param_summary:
+                    if model_name in per_model:
+                        mr = per_model[model_name]
+                        lines.append(
+                            f"  - {model_name}: {mr['return_pct']}% return, {mr['trades']} trades"
+                        )
+            # Show any replaced models' successors
+            if per_model and roster and isinstance(roster, dict):
+                for r in roster.get("replace", []):
+                    if isinstance(r, dict):
+                        removed = r.get("remove", "")
+                        # The successor model may have a different name
+                        for mn, mr in per_model.items():
+                            if mn not in param_summary:  # new model, not one we tuned
+                                pass  # can't reliably match yet
+        else:
+            lines.append("Next-day result: not yet available (this was the most recent review)")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 def _build_review_prompt(data: dict[str, Any], incident_notes: str = "") -> str:
     """Format gathered data into a structured LLM prompt."""
-    data_json = json.dumps(data, indent=2, default=str)
+    # Exclude cfa_memory from the main data JSON (it's rendered separately above)
+    data_for_json = {k: v for k, v in data.items() if k != "cfa_memory"}
+    data_json = json.dumps(data_for_json, indent=2, default=str)
+
+    # Only show changelog entries since last review
+    last_review_date = None
+    cfa_mem = data.get("cfa_memory", [])
+    if cfa_mem:
+        last_review_date = cfa_mem[0].get("date")
 
     return f"""\
-You are a CFA charterholder and portfolio risk analyst reviewing the daily results
-of an evolutionary trading arena. The arena runs 12 competitive AI strategy models
-on live Alpaca paper trading data. Each model has $2,000 starting capital.
+You are the **Chief Strategy Architect** for an evolutionary trading arena. You own the
+strategic direction of 13 AI strategy models competing on live Alpaca paper trading data.
+Each model has $2,000 starting capital. Your goal: make this portfolio real-money ready
+within 3 weeks.
 
+You are NOT a passive reviewer — your recommendations WILL be applied. Every parameter
+change, roster decision, and strategy evolution you output gets executed. Own the outcomes.
+Diagnose causally, prescribe knowing changes take effect, iterate on what you've learned
+from prior reviews, and architect the roster for consistent profitability.
 ## System Architecture
 
 - **Models**: 13 active — 12 base models across 8 strategy types (ma_crossover, rsi_reversion,
   momentum, bollinger_bands, macd, vwap_reversion, breakout, mean_reversion) plus your
   cfa_generated model.
-- **Capital**: $2,000 per model per day ($24,000 total portfolio). Capital resets daily.
+- **Capital**: $2,000 per model per day ($26,000 total portfolio). Capital resets daily.
 - **Fractional shares**: Enabled (min 0.01 shares or $1 notional). Market orders only for fractional.
 - **Risk defaults**: stop_loss_pct=2.0%, take_profit_pct=3.0% (evolvable via self-improvement).
-- **Trailing stop** (NEW, disabled by default): `trailing_stop_pct` = how far below peak to sell,
-  `trailing_stop_activation_pct` = minimum gain before trailing stop activates. Example: activation=1.0,
-  trailing=1.5 means once a position is up 1%, sell if it drops 1.5% from its high-water mark.
-  This lets winners run while locking in gains. Set both params to enable. Recommend per-model.
-- **Position manager**: 15% max exposure per symbol, 80% max total exposure, correlation guards,
-  3% drawdown halves position sizes, 5% drawdown blocks new buys.
-- **Screener**: Discovers top 20 most-active symbols ($5 price floor), re-runs every 15 min.
-  Leveraged ETF blocklist (39 tickers like TQQQ, SQQQ, SOXL, UVIX, etc.) filtered out.
-- **Wind-down**: NO_BUY_WINDOW=10 bars before session end, LIQUIDATION_WINDOW=3 bars forces sells.
+- **Exit mechanisms**: Hard stop-loss, take-profit, ratcheting trailing stops (`trailing_stop_tiers`),
+  patience stops (`patience_stop_tiers`). All CFA-tunable via parameter_recommendations.
+  - `trailing_stop_tiers`: list of `[gain_threshold_pct, trail_distance_pct]` pairs. Trail tightens as gain grows.
+  - `patience_stop_tiers`: list of `[bars_underwater, exit_pct]` pairs. Exits slow-bleed losers.
+- **Position manager**: 15% max per symbol, 80% max total, correlation guards, 3%/5% drawdown circuit breaker.
+- **Screener**: Top 20 most-active symbols ($5 floor), re-runs every 15 min. Leveraged ETF blocklist.
+- **Wind-down**: NO_BUY_WINDOW=10 bars, LIQUIDATION_WINDOW=3 bars.
 - **Self-improvement**: Between sessions — losers 10% mutation, mediocre 5%, winners 2%.
-- **COLLAB model**: Disabled pending redesign as between-session synthesis from top performers.
-- **EOD liquidation**: All positions force-closed at session end + Alpaca hard safety net.
+- **EOD liquidation**: All positions force-closed at session end.
 
-NOTE: The "realized_pnl" field on each model is the authoritative return figure,
-computed from filled sell orders. Use it over "return_pct" or capital-based calculations
-if they disagree.
+NOTE: `realized_pnl` is the authoritative return figure (from filled sell orders).
+`alpaca_pnl` is ground-truth P&L when available. `unattributed_pnl` = gap between the two.
 
-## Strategy Roster — You Have Full Control
+{_build_cfa_memory_section(data)}
 
-The current 12 models use 8 common day-trading strategy types that were picked as a starting
-point: ma_crossover, rsi_reversion, momentum, bollinger_bands, macd, vwap_reversion, breakout,
-mean_reversion. These are NOT sacred — they were chosen as generic baselines to get the arena
-running.
+{_build_changelog_section(last_review_date)}
 
-**You can and should recommend changes to the roster.** Specifically:
-- **Eliminate underperformers**: If a strategy type is consistently losing, recommend we remove
-  it and replace it with something better. Name the specific model(s) to cut. Be aggressive —
-  a model that loses money day after day is actively hurting the portfolio. Don't give it infinite
-  chances. If it lost money yesterday AND today, that's enough evidence to recommend replacement.
-- **Add new strategy types**: If you think a different approach would work better (pairs trading,
-  statistical arbitrage, volume profile, order flow, gamma scalping, etc.), recommend it. We will
-  implement it. Include a brief description of the strategy logic so we can build it.
-- **Rebalance the mix**: If one strategy type dominates, recommend adding more variants of it
-  or reducing over-represented losers.
-- **Replace stale models**: Models that consistently fail to trade (0 trades across multiple days)
-  are wasting a slot. Recommend replacing them with something that will actually participate.
-- **Your generated strategy counts as one of the 12 slots.** If you want to test a radically
-  different approach, you can — just build it in your generated_strategy output.
+## Roster Architecture
 
-The constraint: we want to keep exactly 13 models total (12 base + your cfa_generated model).
-So any additions require removing an equal number. Think of it as portfolio construction — which
-13 strategies give us the best risk-adjusted returns? You always keep your own slot, but you can
-recommend replacing any of the other 12. The operator will act on your recommendations, so be
-direct and decisive — "consider removing" is weaker than "replace X with Y because Z".
+You control 13 strategy slots. 12 base + your cfa_generated. Architect the roster for:
+- **Diversity**: Uncorrelated strategy types covering different regimes (trend, mean-reversion, momentum, volatility).
+- **Accountability**: If a strategy type lost money 2+ consecutive days, recommend replacement with
+  a specific alternative.
+- **Slot efficiency**: 0-trade models waste a slot. Replace with something that participates.
+- Be direct: "replace X with Y because Z" not "consider removing X."
 
-Include roster recommendations in your action_items if you think changes are warranted.
+CRITICAL — SPECIFICITY REQUIREMENT: Every recommendation you make MUST include exact, implementable
+details. You are the expert — your output gets executed directly. No vague suggestions.
+- **Roster replacements**: Must include the full parameter set (every param with exact numeric values),
+  entry/exit logic with specific indicator thresholds, adapt() tuning logic with bounds, and
+  predicted performance. We will build the strategy from your spec — if you leave anything vague,
+  we can't implement it.
+- **Parameter recommendations**: Must include exact target values, not directions ("lower X" is not
+  acceptable — "set X to 0.05" is).
+- **Action items**: Must be specific enough that an engineer can execute without asking follow-up
+  questions. Include the file, function, or parameter to change.
+- You have full visibility into every model's parameters (`all_parameters` in the data). Use them.
+
+## Cross-Strategy Synthesis
+
+Analyze the top 3 performers' winning patterns: what indicators, parameters, entry/exit logic made
+them profitable? Identify losing patterns across bottom performers. Your `cross_strategy_insights`
+output should synthesize what works and what doesn't, and your generated strategy should incorporate
+the winning elements.
 
 Review the following data for {data['session_date']} and produce a structured JSON analysis.
 
 ## Today's Data
 
-The data includes several enriched sections:
-
-### market_data
-- **daily_stats**: Per-symbol daily OHLCV, % change, intraday range, PLUS microstructure stats:
-  - `avg_bar_range_pct`: mean (high-low)/open per 1-min bar — intrabar volatility proxy
-  - `peak_volume_window`: 30-min window with highest volume (e.g., "09:30" = open, "15:30" = close)
-  - `trend_strength`: (close-open)/(high-low), ranges -1 to +1. +1=pure uptrend, -1=pure downtrend, ~0=choppy
-- **intraday_30min**: 30-minute aggregated OHLCV bars for core symbols + top dynamic symbols
-
-### news_sentiment
-- **per_symbol**: avg sentiment score [-1,+1], article count, top headline for each mentioned symbol
-  - Score interpretation: -1.0 = very bearish, 0 = neutral, +1.0 = very bullish
-- **market_wide**: total articles, avg sentiment, bullish/bearish/neutral counts
-- **sentiment_pnl_divergence**: symbols where sentiment disagreed with realized PnL (contrarian signals)
-
-### sector_analysis
-- **sector_returns**: per-sector avg return, volume, symbol count, best/worst performers
-- **correlation_matrix**: cross-sector return correlations (from intraday bar data)
-- **sector_concentration**: which sectors were most/least active
-
-### options_data
-- Per-symbol options chain summary (core + top traded symbols):
-  - `implied_volatility_pct`: avg ATM call IV as percentage — market's expected annualized move
-  - `put_call_ratio`: put volume / call volume. >1.0 = bearish sentiment, <0.7 = bullish
-  - `delta_skew`: avg put delta - avg call delta. More negative = normal; less negative/positive = fear
-  - `call_count`, `put_count`, `call_volume`, `put_volume` for flow analysis
-
-### upcoming_events
-- Corporate actions in next 5 trading days: dividends (ex-date, cash amount), splits (ratio), mergers, spinoffs
-- Use to avoid entering positions before ex-dates or to anticipate volatility around events
-
-### Data NOT available
-- **Order book depth**: NOT available for equities via Alpaca (crypto only). Would need Polygon.io.
-- **Options flow** (unusual activity detection): NOT available. We provide IV + Greeks instead.
-- **Tick-level trade data**: Available in real-time (quote stream) but not persisted. Can add if needed.
-- **Short interest / dark pool volume**: NOT available via Alpaca. Would need third-party data.
-
-Use all this data when analyzing performance and designing your strategy.
+The data includes: market_data (daily_stats + intraday_30min with microstructure),
+news_sentiment (per-symbol + market-wide + divergence flags), sector_analysis (returns +
+correlations), options_data (IV, put/call ratio, delta skew), upcoming_events (dividends,
+splits, mergers in next 5 days).
 
 ```json
 {data_json}
@@ -838,13 +1102,18 @@ Use all this data when analyzing performance and designing your strategy.
 
 ## Your Analysis
 
-Produce ONLY a JSON object (no markdown, no explanation outside JSON) with this exact schema:
+Produce ONLY a JSON object (no markdown, no explanation outside JSON) with this schema:
 
 {{
   "date": "{data['session_date']}",
   "executive_summary": "2-3 sentences summarizing the day",
   "portfolio_grade": "A/B/C/D/F",
   "portfolio_grade_justification": "1-2 sentences",
+  "plain_english_verdict": {{
+    "whats_working": "Plain English paragraph (no jargon) explaining what strategies, patterns, and behaviors are making money and why. Write this so a non-technical person can understand it.",
+    "whats_not_working": "Plain English paragraph explaining what is losing money, why it's failing, and what the core problems are. Be blunt and specific — name the models and what they're doing wrong.",
+    "bottom_line": "1-2 sentence gut-check verdict: is this portfolio heading in the right direction or not?"
+  }},
   "sections": {{
     "performance_analysis": {{
       "headline": "one-line summary",
@@ -900,264 +1169,160 @@ Produce ONLY a JSON object (no markdown, no explanation outside JSON) with this 
       "rejected_order_patterns": "analysis of rejections"
     }}
   }},
+  "self_accountability": {{
+    "prior_recs_assessed": [
+      {{"recommendation": "what you recommended", "outcome": "helped|hurt|neutral|too_early", "evidence": "data points"}}
+    ],
+    "prediction_accuracy": "how accurate were your prior performance predictions",
+    "lessons_learned": "what you'll do differently based on outcomes"
+  }},
+  "cross_strategy_insights": {{
+    "winning_patterns": ["what top performers share"],
+    "losing_patterns": ["what bottom performers share"],
+    "synthesis_notes": "how you're incorporating these into your strategy"
+  }},
+  "strategy_evolution": {{
+    "hypothesis": "what you're testing with this iteration",
+    "changes_from_previous": ["max 3 specific logic changes"],
+    "predicted_performance": {{
+      "expected_win_rate_pct": 0.0,
+      "expected_avg_pnl_per_trade": 0.0,
+      "confidence": "high|medium|low"
+    }}
+  }},
+  "roster_changes": {{
+    "keep": ["model names performing well"],
+    "probation": [{{"model": "name", "reason": "why", "conditions": "what would trigger replacement"}}],
+    "replace": [{{
+      "remove": "exact model name to remove",
+      "replacement_strategy_type": "snake_case registry key for new strategy",
+      "replacement_name": "human readable name for new model",
+      "rationale": "why this replacement is better, citing specific data",
+      "parameters": {{
+        "param_name": "exact numeric value — ALL parameters the strategy needs",
+        "allocation_pct": 0.0,
+        "max_positions": 0,
+        "stop_loss_pct": 0.0,
+        "take_profit_pct": 0.0,
+        "trailing_stop_tiers": [[0.0, 0.0]],
+        "patience_stop_tiers": [[0, 0.0]]
+      }},
+      "entry_logic": "exact buy conditions with specific thresholds/indicators",
+      "exit_logic": "exact sell conditions with specific thresholds",
+      "adapt_logic": "what adapt() should tune, direction, and bounds",
+      "predicted_win_rate": 0.0,
+      "predicted_avg_pnl": 0.0
+    }}]
+  }},
   "action_items": [
     {{"priority": "high/medium/low", "action": "what to do", "rationale": "why"}}
   ],
   "red_flags": ["critical issues that need immediate attention"],
   "next_day_recommendations": "paragraph of recommendations for tomorrow",
-  "open_questions": [
-    {{"topic": "short name", "assessment": "your analysis/opinion on this topic"}}
-  ],
-  "data_requests": [
-    {{
-      "data_type": "short name (e.g. 'order_book_depth', 'tick_data', 'options_flow')",
-      "description": "what this data is and how you'd use it",
-      "priority": "critical/high/medium/low",
-      "rationale": "why this would improve your strategy's returns or risk management"
-    }}
+  "research_notes": [
+    {{"topic": "short name", "finding": "your analysis", "action_needed": "what to build/change/investigate"}}
   ],
   "parameter_recommendations": [
     {{
       "model_name": "<exact model name from the models list>",
       "recommendations": {{
         "<param_name>": {{
-          "value": "<number — the target value you recommend>",
+          "value": "<number or list — the target value>",
           "confidence": "high|medium|low",
           "rationale": "evidence-based reason for this change"
         }}
       }}
     }}
+  ],
+  "changelog_assessment": [
+    {{
+      "change": "<short description of the system change>",
+      "assessment": "positive|negative|neutral|too_early",
+      "evidence": "specific data points supporting your assessment"
+    }}
+  ],
+  "infrastructure_recommendations": [
+    {{
+      "category": "order_execution|risk_management|data_pipeline|position_management|market_microstructure|other",
+      "title": "short descriptive title",
+      "description": "what the improvement is and how it works",
+      "expected_impact": "how this would improve P&L or reduce losses",
+      "priority": "high|medium|low",
+      "complexity": "simple|moderate|complex"
+    }}
   ]
 }}
 
 Be specific, data-driven, and actionable. Reference actual model names, symbols, and numbers.
-If multi_day data is empty (first day), say so and focus on today only.
-For inactive models, diagnose likely causes (short sessions, high thresholds, strategy type mismatch).
 
-CRITICAL: Base your analysis ONLY on the data provided. If all models show 0% returns
-with non-zero trade counts, report this as a data collection issue — do NOT invent or
-extrapolate losses. Never fabricate specific dollar amounts not present in the data.
-
-IMPORTANT: Each model has stop_loss_pct and take_profit_pct fields. If these are null/None, the model
-has NO automatic exit discipline — it will hold positions until its strategy logic generates a sell
-signal or the session ends. Flag any models with null stop_loss_pct or take_profit_pct as a risk
-management concern and recommend they set values (e.g., 2% stop-loss, 3% take-profit) so that
-self-improvement can evolve the thresholds over time.
-
-STOP-LOSS RE-ENTRY PROBLEM: Models currently have no cooldown after a stop-loss fires. A model can
-hit its stop-loss, sell the position, then immediately re-buy the same symbol on the next bar because
-its indicators still say "buy." This creates a cycle of buy->stop-loss->buy->stop-loss that bleeds
-capital through spread/slippage. Consider recommending a post-stop-loss cooldown period (e.g., skip
-the symbol for N bars after a stop-loss fires) or other re-entry discipline for models exhibiting
-this pattern. Check the trade history for rapid buy-sell-buy sequences on the same symbol.
-
-BUG FIX — SELL ORDERS WERE BLOCKED BY CIRCUIT BREAKER (fixed mid-session ~9:53 AM ET today):
-The daily loss circuit breaker was incorrectly blocking ALL orders (including sells) once a model
-exceeded its max daily loss. This meant stop-losses, take-profits, and all exit signals were rejected
-for any model that hit the loss limit. Models were trapped in losing positions with no way to exit
-until end-of-session liquidation. This was the worst possible failure mode — the models losing the
-most were prevented from cutting their losses. The fix (applied ~9:53 AM ET) exempts sell orders
-from the daily loss check so exits always go through. When analyzing today's data:
-- Trades before ~9:53 AM ET were affected by this bug. Models may show unexpectedly large losses
-  from positions they should have exited via stop-loss or take-profit but couldn't.
-- Trades after ~9:53 AM ET reflect correct behavior with working exits.
-- Weight your analysis toward post-fix performance when evaluating model quality.
-- Any model that appears to have "held through" a stop-loss or take-profit trigger before 9:53 AM
-  was a victim of this bug, not a strategy failure.
-
-BUG FIX #2 — PRICE DATA DROPPED FOR HELD POSITIONS (fixed ~10:07 AM ET today):
-The symbol screener rotates the trading universe every 15 minutes based on volume rankings.
-When the arena resumed after a restart, the screener picked a new set of 20 symbols that did NOT
-include 6 symbols with open positions: EEM, F, HYG, NVD, PLTD, SOFI. Without price data, the
-arena could not evaluate stop-losses or take-profits for these positions — they were completely
-blind. For example, PLTD was up +2.2% (approaching the 3% take-profit) but the arena showed it
-at the stale entry price. The fix ensures all symbols with open positions are always included in
-the subscription, regardless of screener results. When analyzing today's data:
-- Between ~9:53 AM and ~10:07 AM ET, positions in EEM, F, HYG, NVD, PLTD, SOFI had no working
-  stop-loss or take-profit because no price updates were being received.
-- Any missed take-profits or excess losses on these 6 symbols during that window were caused by
-  this bug, not strategy failure.
-- After ~10:07 AM ET, all position symbols are subscribed and exits work correctly.
-
-DATA REQUESTS — Your goal is to maximize returns and minimize losses. Include a "data_requests"
-array listing ANY additional data that would help you build a better strategy. Think about what
-a top quantitative fund would want: order book depth, tick-level data, options flow/Greeks,
-sector correlations, earnings calendars, economic indicators, short interest, dark pool volume,
-news sentiment scores, pre-market/after-hours activity, etc. We can wire up new data sources.
-Be specific about what you want, how you'd use it, and why it would improve performance.
-Your strategy competes against 12 others — tell us what edge you need.
+CRITICAL: Base your analysis ONLY on the data provided. Never fabricate dollar amounts not in the data.
 
 PARAMETER RECOMMENDATIONS — Each model's `all_parameters` dict shows its current tunable params.
-Include a "parameter_recommendations" array with specific, evidence-based tuning suggestions:
-- **Confidence levels**: `high` = override the param directly, `medium` = blend 70% toward your target,
-  `low` = bias the random mutation direction toward your target (still random magnitude).
-- Only recommend params you have evidence-based opinions on. Omit params you're unsure about.
-- Focus on underperformers and models with clear parameter issues. Leave top performers alone.
-- You can tune `stop_loss_pct` and `take_profit_pct` on ANY model (these control automatic exits).
-- Use exact model names from the data. Only recommend params that appear in `all_parameters`.
-- If no parameter changes are warranted, return an empty array.
+- **Confidence levels**: `high` = override directly, `medium` = blend 70% toward target, `low` = bias mutation.
+- Focus on underperformers. Leave top performers alone unless you have strong evidence.
+- You can tune `stop_loss_pct`, `take_profit_pct`, `trailing_stop_tiers`, `patience_stop_tiers` on ANY model.
+- Flag models with null stop_loss_pct/take_profit_pct as risk management concerns.
+- Check for stop-loss re-entry loops (buy->stop->buy->stop on same symbol) and recommend cooldowns.
 
-OPEN QUESTIONS — include an "open_questions" array in your response with your assessment of each:
-1. "COLLAB model" — We are considering adding a collaborative model that is synthesized from the
-   top performers between sessions (not a real-time voting ensemble). It would inherit the best
-   parameters from winning strategies. Is this a good idea? What are the risks (overfitting,
-   reduced diversity, regime sensitivity)? How would you structure it?
-2. "Adaptation warm-up period" — The operator has noticed that models seem to perform better later
-   in the session after adapt() has had time to tune parameters. If this is real (not random), should
-   we change our capital deployment strategy? E.g., start with smaller position sizes (say 50%) for
-   the first 30-60 minutes while adaptation calibrates, then ramp up to full allocation. Analyze the
-   intraday performance curve (early vs late trades) and the performance_snapshots timing to determine
-   if this pattern exists in the data. If it does, recommend a specific ramp-up schedule.
-3. "Trailing stops" — We added trailing stop support today after watching PLTD climb +2.5% but
-   not hit the fixed 3% take-profit. The concern: a position can run up significantly, then give
-   back all its gains before hitting take-profit. Trailing stops solve this by selling when price
-   drops a set percentage below its peak. The params are `trailing_stop_pct` (drop from peak to
-   trigger, e.g. 1.5%) and `trailing_stop_activation_pct` (min gain before activating, e.g. 1.0%).
-   Both are currently disabled (None) on all models. Should we enable them? If so, recommend
-   specific values per model in your parameter_recommendations. Consider: should trailing stops
-   replace take-profits, complement them, or only be used on certain strategy types?
-4. "Missing exit mechanisms" — Today we discovered that our sell/exit infrastructure had critical
-   bugs (circuit breaker blocking sells, missing price data for held positions). This made us
-   realize we should think harder about exit discipline. Are there other exit mechanisms we should
-   support beyond stop-loss, take-profit, and trailing stop? Examples: time-based exits (sell after
-   N bars regardless), volatility-adjusted stops (wider stops in volatile regimes), partial profit
-   taking (sell half at +2%, let rest ride), momentum reversal exits, etc. Recommend any additional
-   exit types that would improve risk management, and we will implement them.
-5. "Opening volatility losses" — The operator has observed a consistent pattern across multiple days:
-   models lose money in the first 10-15 minutes after market open (9:30-9:45 ET), then recover later.
-   The opening auction creates wide spreads, volatile price swings, and unreliable signals. Analyze
-   today's trade-level data to quantify this: what % of losses occurred in the first 15 min? Are
-   certain strategy types worse offenders (e.g., breakout chasing false moves, mean-reversion buying
-   into momentum)? Recommend concrete mitigations — possible approaches include: (a) a market-open
-   cooldown that delays all trading for N minutes, (b) reduced position sizing in the first 15-30 min,
-   (c) different strategy activation schedules (e.g., momentum strategies wait 15 min, mean-reversion
-   waits 5 min), or (d) an opening-specific strategy that trades the open differently. Be specific
-   about what you'd implement and why.
+INFRASTRUCTURE RECOMMENDATIONS — Think beyond individual model parameters. Consider system-level
+design patterns and execution strategies that haven't been implemented yet. Examples to consider:
+- **Limit orders vs market orders**: Currently all orders are market orders. Would limit orders at
+  favorable prices (e.g., VWAP deviation targets) reduce slippage and improve fill quality?
+- **Time-of-day awareness**: Are certain hours consistently better/worse? Should models scale
+  position sizes or pause trading during historically bad windows (e.g., first 15 min, lunch lull)?
+- **Correlated position limits**: Models may independently accumulate positions in correlated assets
+  (e.g., NVDA + SOXL, multiple tech stocks). Should there be cross-model correlation guards?
+- **Screener quality**: Are screener-added symbols consistently worse than core symbols? Should
+  the screener filter more aggressively or weight toward momentum quality over raw volume?
+- **Order staging**: Would batching orders or using TWAP/VWAP execution reduce market impact?
+- **Partial exits**: Instead of all-or-nothing sells, could scaling out (sell 50% at +1%, rest at trail)
+  improve risk-adjusted returns?
+- **Entry timing**: Could watching Level 2 / order flow data improve entry prices?
+- **Capital rebalancing**: Should winning models get more capital between sessions?
+- Anything else you observe in the data that suggests a structural improvement.
 
-## Strategy Generation
+## Strategy Evolution Protocol
 
-In addition to your JSON analysis, you must ALSO generate a complete Python strategy class.
-You have full creative freedom — use ANY combination of indicators and logic you want.
-Base your design on what worked (and what didn't) in today's data.
+Generate a complete `CfaGeneratedStrategy` Python class. **Key constraint**: make at most
+3 logic changes from the previous version. No wholesale rewrites unless this is the first
+generation. State your hypothesis and predict expected performance (you'll be held accountable).
 
-You have access to the full market_data (daily stats + 30-min intraday bars) above.
-Use it to understand what price action, volatility, and volume patterns looked like.
-Design your strategy to exploit the patterns you observe. You are not limited to any
-particular approach — combine multiple indicators, use regime detection, volume analysis,
-multi-timeframe logic, whatever you think will work best.
+The `strategy_evolution` section MUST include specific parameter values and indicator thresholds,
+not vague descriptions. Example: "buy when close < VWAP * 0.999 and volume > 1.2x avg_20" is
+good. "buy on VWAP dips with volume confirmation" is NOT acceptable.
 
 ### Base Class API
 
 ```python
 from src.core.strategy import BarData, Strategy, TradeSignal
-
-# BarData fields: symbol, timestamp, open, high, low, close, volume, minutes_remaining
+# BarData: symbol, timestamp, open, high, low, close, volume, minutes_remaining,
+#   daily_context: DailyContext (daily_open, running_high, running_low, daily_vwap, prev_close,
+#     change_from_open_pct, change_from_prev_close_pct, daily_range_position) — None if unavailable
+#   spy_daily_context: DailyContext — SPY's daily context as market trend proxy on every bar
 # TradeSignal(symbol, side="buy"|"sell", quantity)
-
 class Strategy(ABC):
-    strategy_type: str = "base"
-    current_capital: float          # available cash
-    _positions: dict[str, float]    # symbol -> quantity held
-    _entry_prices: dict[str, float] # symbol -> avg entry price
+    current_capital: float; _positions: dict[str, float]; _entry_prices: dict[str, float]
     _bar_history: dict[str, list[BarData]]
-
-    def record_bar(self, bar: BarData) -> None: ...     # stores bar in history
-    def check_liquidation(self, bar: BarData) -> TradeSignal | None: ...  # EOD wind-down
-    def get_close_series(self, symbol: str, lookback: int = 0) -> pd.Series: ...  # close prices
-    def compute_quantity(self, price: float, allocation_pct: float = 0.25) -> float: ...  # fractional shares
-    def get_history(self, symbol: str, lookback: int = 0) -> list[BarData]: ...
+    def record_bar(self, bar) -> None: ...
+    def check_liquidation(self, bar) -> TradeSignal | None: ...
+    def get_close_series(self, symbol, lookback=0) -> pd.Series: ...
+    def compute_quantity(self, price, allocation_pct=0.25) -> float: ...
+    def get_history(self, symbol, lookback=0) -> list[BarData]: ...
 ```
 
-### Available imports
-numpy, pandas, math, logging (already in environment — do NOT import anything else)
-
-### Example (RSI strategy for reference)
-
-```python
-class RSIReversionStrategy(Strategy):
-    strategy_type = "rsi_reversion"
-
-    def __init__(self, name, params=None):
-        self.rsi_period = 14
-        self.oversold = 30.0
-        self.overbought = 70.0
-        self.allocation_pct = 0.25
-        super().__init__(name, params)
-
-    def _compute_rsi(self, closes):
-        if len(closes) < self.rsi_period + 1:
-            return 50.0
-        deltas = closes.diff().dropna()
-        gains = deltas.where(deltas > 0, 0.0)
-        losses = (-deltas.where(deltas < 0, 0.0))
-        avg_gain = gains.rolling(self.rsi_period).mean().iloc[-1]
-        avg_loss = losses.rolling(self.rsi_period).mean().iloc[-1]
-        if avg_loss == 0:
-            return 100.0
-        rs = avg_gain / avg_loss
-        return 100.0 - (100.0 / (1.0 + rs))
-
-    def on_bar(self, bar):
-        self.record_bar(bar)
-        liq = self.check_liquidation(bar)
-        if liq:
-            return liq if liq.quantity > 0 else None
-        closes = self.get_close_series(bar.symbol)
-        if len(closes) < self.rsi_period + 1:
-            return None
-        rsi = self._compute_rsi(closes)
-        if rsi < self.oversold:
-            qty = self.compute_quantity(bar.close, self.allocation_pct)
-            if qty > 0:
-                return TradeSignal(symbol=bar.symbol, side="buy", quantity=qty)
-        if rsi > self.overbought:
-            qty = self.compute_quantity(bar.close, self.allocation_pct)
-            if qty > 0:
-                return TradeSignal(symbol=bar.symbol, side="sell", quantity=qty)
-        return None
-
-    def get_params(self):
-        return {{"rsi_period": self.rsi_period, "oversold": self.oversold,
-                "overbought": self.overbought, "allocation_pct": self.allocation_pct}}
-
-    def set_params(self, params):
-        self.rsi_period = max(2, int(params.get("rsi_period", self.rsi_period)))
-        self.oversold = max(5.0, min(45.0, float(params.get("oversold", self.oversold))))
-        self.overbought = max(55.0, min(95.0, float(params.get("overbought", self.overbought))))
-        self.allocation_pct = max(0.05, min(1.0, float(params.get("allocation_pct", self.allocation_pct))))
-
-    def adapt(self, recent_signals, recent_fills, realized_pnl):
-        pass  # optional
-```
-
-### Requirements for your generated class
-1. Class name MUST be `CfaGeneratedStrategy`
-2. `strategy_type = "cfa_generated"`
-3. Must subclass `Strategy` and call `super().__init__(name, params)` in `__init__`
-4. Must implement `on_bar(self, bar)` — call `self.record_bar(bar)` and `self.check_liquidation(bar)` first
-5. Must implement `get_params(self)` and `set_params(self, params)`
-6. Return `TradeSignal(symbol=bar.symbol, side="buy"|"sell", quantity=qty)` or `None`
-7. Use `self.compute_quantity(price, allocation_pct)` for position sizing
-8. Only import from: `numpy`, `pandas`, `math`, `logging`, and `src.core.strategy`
-9. Include the full file with all imports at the top
-10. You can use multiple indicators, regime detection, volume analysis — anything you want
-11. The `adapt()` method is optional but recommended for intra-session tuning
+### Requirements
+1. Class: `CfaGeneratedStrategy`, `strategy_type = "cfa_generated"`, subclass `Strategy`
+2. Must implement `on_bar`, `get_params`, `set_params`. Call `record_bar` + `check_liquidation` first.
+3. Only import: numpy, pandas, math, logging, src.core.strategy
+4. Include `adapt()` for intra-session tuning
+5. `"generated_strategy"` key = complete Python source as string (\\n for newlines)
 
 {_build_cfa_model_section(data)}
-
-### Output format
-Include a `"generated_strategy"` key in your JSON response. Its value must be a STRING containing
-the complete, valid Python source code for the file. Use \\n for newlines within the string.
-The file should be self-contained and ready to write to `src/strategies/cfa_generated.py`.
-{f'''
+{f"""
 ## Incident Notes
 
-The following operational incidents occurred during today's session. Factor these into your
-analysis, particularly in the risk_management and execution_quality sections. Note which data
-may be affected and adjust your assessment accordingly.
-
 {incident_notes}
-''' if incident_notes else ''}"""
+""" if incident_notes else ""}"""
 
 
 def _render_markdown(review: dict[str, Any]) -> str:
@@ -1172,8 +1337,68 @@ def _render_markdown(review: dict[str, Any]) -> str:
     lines.append(review.get("executive_summary", ""))
     lines.append("")
 
-    sections = review.get("sections", {})
+    # Plain English verdict
+    verdict = review.get("plain_english_verdict", {})
+    if verdict:
+        lines.append("## The Verdict (Plain English)")
+        lines.append("")
+        working = verdict.get("whats_working", "")
+        if working:
+            lines.append(f"**What's Working:** {working}")
+            lines.append("")
+        not_working = verdict.get("whats_not_working", "")
+        if not_working:
+            lines.append(f"**What's Not Working:** {not_working}")
+            lines.append("")
+        bottom_line = verdict.get("bottom_line", "")
+        if bottom_line:
+            lines.append(f"**Bottom Line:** {bottom_line}")
+            lines.append("")
 
+    # Self-accountability
+    accountability = review.get("self_accountability", {})
+    if accountability:
+        lines.append("## Self-Accountability")
+        prior_recs = accountability.get("prior_recs_assessed", [])
+        if prior_recs:
+            lines.append("")
+            lines.append("| Recommendation | Outcome | Evidence |")
+            lines.append("|---|---|---|")
+            for rec in prior_recs:
+                if isinstance(rec, dict):
+                    lines.append(
+                        f"| {rec.get('recommendation', '?')} "
+                        f"| {rec.get('outcome', '?')} "
+                        f"| {rec.get('evidence', '')} |"
+                    )
+            lines.append("")
+        accuracy = accountability.get("prediction_accuracy", "")
+        if accuracy:
+            lines.append(f"*Prediction accuracy*: {accuracy}")
+            lines.append("")
+        lessons = accountability.get("lessons_learned", "")
+        if lessons:
+            lines.append(f"*Lessons learned*: {lessons}")
+            lines.append("")
+
+    # Cross-strategy insights
+    insights = review.get("cross_strategy_insights", {})
+    if insights:
+        lines.append("## Cross-Strategy Insights")
+        for field in ("winning_patterns", "losing_patterns"):
+            items = insights.get(field, [])
+            if items:
+                lines.append(f"**{field.replace('_', ' ').title()}**:")
+                for item in items:
+                    lines.append(f"- {item}")
+                lines.append("")
+        synthesis = insights.get("synthesis_notes", "")
+        if synthesis:
+            lines.append(f"*Synthesis*: {synthesis}")
+            lines.append("")
+
+    # Standard sections
+    sections = review.get("sections", {})
     section_titles = {
         "performance_analysis": "Performance Analysis",
         "best_performers": "Best Performers",
@@ -1199,7 +1424,6 @@ def _render_markdown(review: dict[str, Any]) -> str:
             lines.append(f"**{headline}**")
             lines.append("")
 
-        # Render known sub-fields
         for field in ("detail", "concentration_risk", "opportunities_missed",
                       "expectancy_assessment", "circuit_breaker_assessment",
                       "convergence_warning", "inactive_strategies",
@@ -1210,7 +1434,6 @@ def _render_markdown(review: dict[str, Any]) -> str:
                 lines.append(f"*{field.replace('_', ' ').title()}*: {val}")
                 lines.append("")
 
-        # Render lists
         for field in ("concerns", "positives", "trending_up", "trending_down",
                       "recommendations"):
             items = section.get(field, [])
@@ -1220,7 +1443,6 @@ def _render_markdown(review: dict[str, Any]) -> str:
                     lines.append(f"- {item}")
                 lines.append("")
 
-        # Render model lists (best/worst performers)
         model_list = section.get("models", [])
         if model_list:
             for entry in model_list:
@@ -1228,6 +1450,58 @@ def _render_markdown(review: dict[str, Any]) -> str:
                     lines.append(f"- **{entry.get('name', '?')}**: {entry.get('why', '')}")
                 else:
                     lines.append(f"- {entry}")
+            lines.append("")
+
+    # Strategy evolution
+    evolution = review.get("strategy_evolution", {})
+    if evolution:
+        lines.append("## Strategy Evolution")
+        hypo = evolution.get("hypothesis", "")
+        if hypo:
+            lines.append(f"**Hypothesis**: {hypo}")
+            lines.append("")
+        changes = evolution.get("changes_from_previous", [])
+        if changes:
+            lines.append("**Changes**:")
+            for c in changes:
+                lines.append(f"- {c}")
+            lines.append("")
+        predicted = evolution.get("predicted_performance", {})
+        if predicted:
+            lines.append(
+                f"**Predicted**: win_rate={predicted.get('expected_win_rate_pct', '?')}%, "
+                f"avg_pnl=${predicted.get('expected_avg_pnl_per_trade', '?')} "
+                f"[{predicted.get('confidence', '?')}]"
+            )
+            lines.append("")
+
+    # Roster changes
+    roster = review.get("roster_changes", {})
+    if roster:
+        lines.append("## Roster Changes")
+        keep = roster.get("keep", [])
+        if keep:
+            lines.append(f"**Keep**: {', '.join(keep)}")
+            lines.append("")
+        probation = roster.get("probation", [])
+        if probation:
+            lines.append("**Probation**:")
+            for p in probation:
+                if isinstance(p, dict):
+                    lines.append(f"- **{p.get('model', '?')}**: {p.get('reason', '')} "
+                                 f"(conditions: {p.get('conditions', '')})")
+            lines.append("")
+        replace = roster.get("replace", [])
+        if replace:
+            lines.append("**Replace**:")
+            for r in replace:
+                if isinstance(r, dict):
+                    lines.append(f"- Remove **{r.get('remove', '?')}** -> "
+                                 f"Add **{r.get('replacement_type', '?')}**: "
+                                 f"{r.get('rationale', '')}")
+                    logic = r.get("replacement_logic", "")
+                    if logic:
+                        lines.append(f"  Logic: {logic}")
             lines.append("")
 
     # Action items
@@ -1257,7 +1531,23 @@ def _render_markdown(review: dict[str, Any]) -> str:
         lines.append(next_day)
         lines.append("")
 
-    # Open questions
+    # Research notes (replaces open_questions + data_requests)
+    research = review.get("research_notes", [])
+    if research:
+        lines.append("## Research Notes")
+        for note in research:
+            if isinstance(note, dict):
+                lines.append(f"### {note.get('topic', '?')}")
+                lines.append(note.get("finding", ""))
+                action = note.get("action_needed", "")
+                if action:
+                    lines.append(f"\n> **Action needed**: {action}")
+                lines.append("")
+            else:
+                lines.append(f"- {note}")
+        lines.append("")
+
+    # Legacy: open_questions (backward compat with old reviews)
     open_qs = review.get("open_questions", [])
     if open_qs:
         lines.append("## Open Questions")
@@ -1270,19 +1560,14 @@ def _render_markdown(review: dict[str, Any]) -> str:
                 lines.append(f"- {q}")
         lines.append("")
 
-    # Data requests
+    # Legacy: data_requests (backward compat with old reviews)
     data_reqs = review.get("data_requests", [])
     if data_reqs:
         lines.append("## Data Requests")
-        lines.append("*What the CFA wants to build a better strategy:*")
-        lines.append("")
         for req in data_reqs:
             if isinstance(req, dict):
                 prio = req.get("priority", "medium").upper()
-                lines.append(f"### [{prio}] {req.get('data_type', '?')}")
-                lines.append(req.get("description", ""))
-                lines.append(f"\n*Rationale*: {req.get('rationale', '')}")
-                lines.append("")
+                lines.append(f"- [{prio}] **{req.get('data_type', '?')}**: {req.get('description', '')} — {req.get('rationale', '')}")
             else:
                 lines.append(f"- {req}")
         lines.append("")
@@ -1308,6 +1593,43 @@ def _render_markdown(review: dict[str, Any]) -> str:
                     else:
                         lines.append(f"- **{param}**: {spec}")
             lines.append("")
+
+    # Infrastructure recommendations
+    infra_recs = review.get("infrastructure_recommendations", [])
+    if infra_recs:
+        lines.append("## Infrastructure Recommendations")
+        lines.append("")
+        for entry in infra_recs:
+            if isinstance(entry, dict):
+                title = entry.get("title", "?")
+                cat = entry.get("category", "other")
+                prio = entry.get("priority", "medium").upper()
+                desc = entry.get("description", "")
+                impact = entry.get("expected_impact", "")
+                complexity = entry.get("complexity", "?")
+                lines.append(f"### [{prio}] {title} ({cat})")
+                lines.append(f"- **Description**: {desc}")
+                lines.append(f"- **Expected impact**: {impact}")
+                lines.append(f"- **Complexity**: {complexity}")
+                lines.append("")
+            else:
+                lines.append(f"- {entry}")
+        lines.append("")
+
+    # Changelog assessment
+    changelog = review.get("changelog_assessment", [])
+    if changelog:
+        lines.append("## Changelog Assessment")
+        lines.append("")
+        for entry in changelog:
+            if isinstance(entry, dict):
+                change = entry.get("change", "?")
+                assessment = entry.get("assessment", "?").upper()
+                evidence = entry.get("evidence", "")
+                lines.append(f"- **{change}** [{assessment}] — {evidence}")
+            else:
+                lines.append(f"- {entry}")
+        lines.append("")
 
     return "\n".join(lines)
 
@@ -1451,14 +1773,49 @@ def extract_parameter_recommendations(
                 continue
             value = spec.get("value")
             confidence = spec.get("confidence", "").lower()
+            if confidence not in VALID_CONFIDENCE_LEVELS:
+                continue
+
+            # Special case: trailing_stop_tiers is a list of [gain, trail] pairs
+            if param == "trailing_stop_tiers":
+                if isinstance(value, list) and all(
+                    isinstance(p, (list, tuple)) and len(p) == 2
+                    for p in value
+                ):
+                    try:
+                        validated = [[float(p[0]), float(p[1])] for p in value]
+                        valid_recs[param] = {
+                            "value": validated,
+                            "confidence": confidence,
+                            "rationale": str(spec.get("rationale", "")),
+                        }
+                    except (TypeError, ValueError):
+                        pass
+                continue
+
+            # Special case: patience_stop_tiers is a list of [bars, exit_pct] pairs
+            if param == "patience_stop_tiers":
+                if isinstance(value, list) and all(
+                    isinstance(p, (list, tuple)) and len(p) == 2
+                    for p in value
+                ):
+                    try:
+                        validated = [[int(p[0]), float(p[1])] for p in value]
+                        valid_recs[param] = {
+                            "value": validated,
+                            "confidence": confidence,
+                            "rationale": str(spec.get("rationale", "")),
+                        }
+                    except (TypeError, ValueError):
+                        pass
+                continue
+
             if not isinstance(value, (int, float)):
                 # Try to parse string numbers
                 try:
                     value = float(value)
                 except (TypeError, ValueError):
                     continue
-            if confidence not in VALID_CONFIDENCE_LEVELS:
-                continue
             valid_recs[param] = {
                 "value": value,
                 "confidence": confidence,

@@ -15,6 +15,11 @@ from src.strategies.breakout import BreakoutStrategy
 from src.strategies.mean_reversion import MeanReversionStrategy
 from src.strategies.collab import CollabStrategy
 from src.strategies.news_sentiment import NewsSentimentStrategy
+from src.strategies.volume_profile_reversion import VolumeProfileReversionStrategy
+from src.strategies.volatility_compression import VolatilityCompressionStrategy
+from src.strategies.momentum_breakout import MomentumBreakoutStrategy
+from src.strategies.atr_breakout_simple import ATRBreakoutSimpleStrategy
+from src.strategies.atr_breakout import ATRBreakoutStrategy
 
 STRATEGY_REGISTRY: dict[str, type[Strategy]] = {
     "ma_crossover": MACrossoverStrategy,
@@ -29,6 +34,11 @@ STRATEGY_REGISTRY: dict[str, type[Strategy]] = {
     "mean_reversion": MeanReversionStrategy,
     "news_sentiment": NewsSentimentStrategy,
     "collab": CollabStrategy,
+    "volume_profile_reversion": VolumeProfileReversionStrategy,
+    "volatility_compression": VolatilityCompressionStrategy,
+    "momentum_breakout": MomentumBreakoutStrategy,
+    "atr_breakout_simple": ATRBreakoutSimpleStrategy,
+    "atr_breakout": ATRBreakoutStrategy,
 }
 
 # Dynamically load CFA-generated strategy if it exists on disk

@@ -61,7 +61,7 @@ class MACDStrategy(Strategy):
             return None
 
         if prev_hist <= self.histogram_threshold and current_hist > self.histogram_threshold:
-            qty = self.compute_quantity(bar.close, self.allocation_pct)
+            qty = self.compute_quantity(bar.close, self.allocation_pct, symbol=bar.symbol)
             if qty > 0:
                 return TradeSignal(symbol=bar.symbol, side="buy", quantity=qty)
 
@@ -96,10 +96,10 @@ class MACDStrategy(Strategy):
     def adapt(self, recent_signals: list, recent_fills: list, realized_pnl: float) -> None:
         old_thresh = self.histogram_threshold
         if realized_pnl < 0:
-            self.histogram_threshold += 0.05
+            self.histogram_threshold += 0.02
         elif realized_pnl > 0:
             self.histogram_threshold -= 0.02
-        self.histogram_threshold = max(0.0, min(1.0, self.histogram_threshold))
+        self.histogram_threshold = max(0.0, min(0.5, self.histogram_threshold))
         logger.info(
             f"{self.name} adapt: histogram_threshold {old_thresh:.2f}->{self.histogram_threshold:.2f}, "
             f"pnl={realized_pnl:.2f}"

@@ -55,7 +55,7 @@ class MomentumStrategy(Strategy):
         }
 
         if roc > self.buy_threshold and volume_ratio > self.volume_filter:
-            qty = self.compute_quantity(bar.close, self.allocation_pct)
+            qty = self.compute_quantity(bar.close, self.allocation_pct, symbol=bar.symbol)
             if qty > 0:
                 return TradeSignal(symbol=bar.symbol, side="buy", quantity=qty)
 

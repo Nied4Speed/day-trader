@@ -110,6 +110,7 @@ class Order(Base):
     transaction_cost = Column(Float, nullable=False, default=0.0)
     realized_pnl = Column(Float, nullable=True)  # P&L for sell orders
     alpaca_order_id = Column(String(100), nullable=True)
+    signal_reason = Column(String(50), nullable=True)
     submitted_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     filled_at = Column(DateTime, nullable=True)
     rejected_reason = Column(Text, nullable=True)
@@ -267,6 +268,7 @@ class SessionRecord(Base):
     ended_at = Column(DateTime, nullable=True)
     total_bars = Column(Integer, nullable=False, default=0)
     total_trades = Column(Integer, nullable=False, default=0)
+    alpaca_pnl = Column(Float, nullable=True)  # Real P&L from Alpaca account
     summary = Column(JSON, nullable=True)
 
     __table_args__ = (
@@ -320,6 +322,19 @@ def init_db(db_path: str = "day_trader.db"):
             conn.commit()
         except Exception:
             conn.rollback()  # column already exists
+        # Add signal_reason to orders table (trade reason tracking)
+        try:
+            conn.execute(text("ALTER TABLE orders ADD COLUMN signal_reason VARCHAR(50)"))
+            conn.commit()
+        except Exception:
+            conn.rollback()  # column already exists
+        # Add alpaca_pnl to sessions table (real Alpaca account P&L)
+        try:
+            conn.execute(text("ALTER TABLE sessions ADD COLUMN alpaca_pnl FLOAT"))
+            conn.commit()
+        except Exception:
+            conn.rollback()  # column already exists
+
     return engine
 
 

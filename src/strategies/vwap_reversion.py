@@ -51,7 +51,7 @@ class VWAPReversionStrategy(Strategy):
         }
 
         if deviation < self.deviation_buy:
-            qty = self.compute_quantity(bar.close, self.allocation_pct)
+            qty = self.compute_quantity(bar.close, self.allocation_pct, symbol=bar.symbol)
             if qty > 0:
                 return TradeSignal(symbol=bar.symbol, side="buy", quantity=qty)
         if deviation > self.deviation_sell:

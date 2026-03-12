@@ -220,7 +220,10 @@ def _get_live_model_data() -> list[dict]:
         total_pnl = (capital + position_cost) - initial  # realized only
         return_pct = ((equity - initial) / initial) * 100 if initial > 0 else 0
 
-        deployment_pct = (position_cost / initial) * 100 if initial > 0 else 0
+        # Deployed = capital spent on positions (initial minus remaining cash)
+        # Clamped to 0 since realized profits can push capital above initial
+        capital_deployed = max(0, initial - capital)
+        deployment_pct = (capital_deployed / initial) * 100 if initial > 0 else 0
 
         models_data.append({
             "id": model_id,
@@ -231,7 +234,7 @@ def _get_live_model_data() -> list[dict]:
             "genetic_operation": record.genetic_operation,
             "initial_capital": initial,
             "current_capital": round(capital, 2),
-            "capital_deployed": round(position_cost, 2),
+            "capital_deployed": round(capital_deployed, 2),
             "deployment_pct": round(deployment_pct, 1),
             "performance": {
                 "equity": round(equity, 2),
@@ -260,7 +263,23 @@ def _get_live_dashboard() -> dict:
     base = _dashboard_cache or {
         "models": [], "trades": [], "generations": [], "sessions": [],
     }
-    return {**base, "models": models}
+    result = {**base, "models": models}
+    # Include macro regime info when arena is running
+    if _arena_instance is not None:
+        mr = _arena_instance.macro_regime
+        result["macro_regime"] = {
+            "regime": mr.regime.value,
+            "multipliers": {
+                "stop_loss": round(mr.multipliers.stop_loss, 2),
+                "trailing_trail": round(mr.multipliers.trailing_trail, 2),
+                "patience_bars": round(mr.multipliers.patience_bars, 2),
+                "allocation": round(mr.multipliers.allocation, 2),
+                "buy_gate_open": mr.multipliers.buy_gate_open,
+                "breakeven_activate_pct": round(mr.multipliers.breakeven_activate_pct, 2),
+            },
+            "emergency_bear": mr._emergency_bear,
+        }
+    return result
 
 
 class ArenaStartRequest(BaseModel):
@@ -384,7 +403,8 @@ def get_dashboard_data(session_date: str | None = None) -> dict:
             pos_cost = sum(
                 p.avg_entry_price * p.quantity for p in positions if p.quantity > 0.001
             )
-            dep_pct = (pos_cost / model.initial_capital) * 100 if model.initial_capital > 0 else 0
+            cap_deployed = max(0, model.initial_capital - model.current_capital)
+            dep_pct = (cap_deployed / model.initial_capital) * 100 if model.initial_capital > 0 else 0
 
             model_data.append({
                 "id": model.id,
@@ -395,7 +415,7 @@ def get_dashboard_data(session_date: str | None = None) -> dict:
                 "genetic_operation": model.genetic_operation,
                 "initial_capital": model.initial_capital,
                 "current_capital": model.current_capital,
-                "capital_deployed": round(pos_cost, 2),
+                "capital_deployed": round(cap_deployed, 2),
                 "deployment_pct": round(dep_pct, 1),
                 "performance": {
                     "equity": snapshot.equity if snapshot else model.current_capital,

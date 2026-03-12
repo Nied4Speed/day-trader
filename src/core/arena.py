@@ -1934,32 +1934,31 @@ class Arena:
     # ── Daily context tracking ───────────────────────────────────────────
 
     def _seed_daily_context_from_warmup(self) -> None:
-        """Derive daily context from warmup bars already in strategy history.
+        """Fetch today's full bar history (9:30 AM → now) to seed daily context.
 
-        Scans any strategy's _bar_history for today's bars (>= 9:30 AM ET)
-        to find daily open, running high/low, cumulative VWAP, and yesterday's
-        close per symbol.
+        Also fetches yesterday's last bar for prev_close. This ensures mid-day
+        starts have complete daily open/high/low/VWAP even if we join at 1 PM.
+        Feeds today's bars through strategies so indicators are primed on the
+        full morning's action, not just the last 50 bars.
         """
         try:
-            self._seed_daily_context_from_warmup_inner()
+            self._seed_daily_context_inner()
         except Exception:
-            logger.exception("Daily context warmup seeding failed (non-fatal)")
+            logger.exception("Daily context seeding failed (non-fatal)")
 
-    def _seed_daily_context_from_warmup_inner(self) -> None:
-        today = datetime.now(ET).date()
+    def _seed_daily_context_inner(self) -> None:
+        now = datetime.now(ET)
+        today = now.date()
         market_open_dt = datetime.combine(today, MARKET_OPEN, tzinfo=ET)
 
-        # Grab bar history from the first strategy that has one
-        sample_strategy = next(iter(self._models.values()), None)
-        if not sample_strategy or not hasattr(sample_strategy, '_bar_history'):
-            logger.info("Daily context: no bar history available after warmup")
-            return
-
-        # _bar_history is dict[str, list[BarData]] — already keyed by symbol
-        bars_by_symbol = sample_strategy._bar_history
+        # Fetch today's bars from 9:30 AM + yesterday for prev_close
+        symbols = self.config.arena.symbols
+        logger.info(f"Fetching today's full bar history for {len(symbols)} symbols...")
+        bars_by_symbol = self.feed.fetch_historical_bars(
+            symbols, start_date=market_open_dt - timedelta(days=1), end_date=now,
+        )
 
         def _to_datetime(ts) -> datetime:
-            """Convert pd.Timestamp or datetime to tz-aware datetime."""
             if hasattr(ts, 'to_pydatetime'):
                 dt = ts.to_pydatetime()
             else:
@@ -1969,39 +1968,41 @@ class Arena:
             return dt
 
         seeded = 0
+        total_today_bars = 0
         for symbol, bars in bars_by_symbol.items():
             if not bars:
                 continue
-            bars = list(bars)  # copy so sort doesn't mutate strategy state
             bars.sort(key=lambda b: b.timestamp)
 
             # Find yesterday's close (last bar before today's open)
             prev_close = None
             for bar in reversed(bars):
-                bar_dt = _to_datetime(bar.timestamp)
-                if bar_dt < market_open_dt:
+                if _to_datetime(bar.timestamp) < market_open_dt:
                     prev_close = bar.close
                     break
 
-            # Filter to today's market-hours bars only
-            today_bars = []
-            for bar in bars:
-                bar_dt = _to_datetime(bar.timestamp)
-                if bar_dt >= market_open_dt:
-                    today_bars.append(bar)
+            # Filter to today's market-hours bars
+            today_bars = [b for b in bars if _to_datetime(b.timestamp) >= market_open_dt]
 
             if not today_bars:
-                # No today bars yet (pre-market) — still store prev_close if available
                 if prev_close is not None:
                     self._daily_context[symbol] = {
-                        "open": None,
-                        "high": None,
-                        "low": None,
-                        "vwap_pv": 0.0,
-                        "vwap_vol": 0,
+                        "open": None, "high": None, "low": None,
+                        "vwap_pv": 0.0, "vwap_vol": 0,
                         "prev_close": prev_close,
                     }
                 continue
+
+            # Feed today's bars through strategies (primes indicators on full day)
+            for bar in today_bars:
+                bar.minutes_remaining = None
+                for strategy in self._models.values():
+                    try:
+                        strategy.record_bar(bar)
+                        strategy.on_bar(bar)
+                    except Exception:
+                        pass
+            total_today_bars += len(today_bars)
 
             first = today_bars[0]
             high = max(b.high for b in today_bars)
@@ -2021,7 +2022,10 @@ class Arena:
             }
             seeded += 1
 
-        logger.info(f"Daily context seeded for {seeded} symbols from warmup bars")
+        logger.info(
+            f"Daily context seeded for {seeded} symbols from {total_today_bars} "
+            f"today's bars (9:30 AM → now)"
+        )
 
     def _seed_daily_context_from_snapshots(self, snapshots: dict) -> None:
         """Seed daily context from Alpaca snapshot objects (screener additions).

@@ -1940,6 +1940,12 @@ class Arena:
         to find daily open, running high/low, cumulative VWAP, and yesterday's
         close per symbol.
         """
+        try:
+            self._seed_daily_context_from_warmup_inner()
+        except Exception:
+            logger.exception("Daily context warmup seeding failed (non-fatal)")
+
+    def _seed_daily_context_from_warmup_inner(self) -> None:
         today = datetime.now(ET).date()
         market_open_dt = datetime.combine(today, MARKET_OPEN, tzinfo=ET)
 
@@ -1949,21 +1955,30 @@ class Arena:
             logger.info("Daily context: no bar history available after warmup")
             return
 
-        # Collect all bars by symbol from history
-        bars_by_symbol: dict[str, list[BarData]] = {}
-        for bar in sample_strategy._bar_history:
-            bars_by_symbol.setdefault(bar.symbol, []).append(bar)
+        # _bar_history is dict[str, list[BarData]] — already keyed by symbol
+        bars_by_symbol = sample_strategy._bar_history
+
+        def _to_datetime(ts) -> datetime:
+            """Convert pd.Timestamp or datetime to tz-aware datetime."""
+            if hasattr(ts, 'to_pydatetime'):
+                dt = ts.to_pydatetime()
+            else:
+                dt = ts
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=ET)
+            return dt
 
         seeded = 0
         for symbol, bars in bars_by_symbol.items():
+            if not bars:
+                continue
+            bars = list(bars)  # copy so sort doesn't mutate strategy state
             bars.sort(key=lambda b: b.timestamp)
 
             # Find yesterday's close (last bar before today's open)
             prev_close = None
             for bar in reversed(bars):
-                bar_dt = bar.timestamp.to_pydatetime()
-                if hasattr(bar_dt, 'tzinfo') and bar_dt.tzinfo is None:
-                    bar_dt = bar_dt.replace(tzinfo=ET)
+                bar_dt = _to_datetime(bar.timestamp)
                 if bar_dt < market_open_dt:
                     prev_close = bar.close
                     break
@@ -1971,9 +1986,7 @@ class Arena:
             # Filter to today's market-hours bars only
             today_bars = []
             for bar in bars:
-                bar_dt = bar.timestamp.to_pydatetime()
-                if hasattr(bar_dt, 'tzinfo') and bar_dt.tzinfo is None:
-                    bar_dt = bar_dt.replace(tzinfo=ET)
+                bar_dt = _to_datetime(bar.timestamp)
                 if bar_dt >= market_open_dt:
                     today_bars.append(bar)
 
